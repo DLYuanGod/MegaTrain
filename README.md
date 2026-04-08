@@ -165,17 +165,7 @@ See [`examples/configs/`](examples/configs/) for ready-made configurations.
 - **HuggingFace native Flash Attention** integration
 - **DeepSpeed CPUAdam** for 5-7x faster optimizer steps
 
-## Requirements
-
-| Component | Minimum | Recommended |
-|:----------|:--------|:------------|
-| GPU | 40GB+ VRAM (A100) | 80GB (H100/H200) |
-| CPU RAM | 128GB (7B models) | 256GB+ (32B+ models) |
-| CUDA | 11.8 | 12.0+ |
-| PyTorch | 2.0 | 2.4+ |
-| Python | 3.9 | 3.10+ |
-
-### Installation
+## Installation
 
 ```bash
 git clone https://github.com/DLYuanGod/MegaTrain.git
