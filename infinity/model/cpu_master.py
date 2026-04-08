@@ -57,183 +57,71 @@ def _preserve_attn_implementation(layer, model_config):
 def _discover_model_components(hf_model):
     """Discover model components via attribute introspection.
 
-    Supports LLM and VLM models:
-    - LLM: LLaMA, Qwen, Mistral, Phi, Gemma, GPT-2, DeepSeek, etc.
-    - VLM: Qwen2-VL, Qwen3-VL, Qwen3.5-VL, LLaVA, Llama4-VL, Gemma3-VL,
-            InternVL, GLM-4V, MiniCPM-V, etc.
+    Supports: LLaMA, Qwen, Mistral, Phi, Gemma, GPT-2, GPT-Neo, DeepSeek, etc.
 
     Returns:
-        dict with keys: 'model_core', 'embedding', 'layers', 'norm', 'lm_head',
-                        'rotary_emb', 'vision_encoder', 'projector', 'is_vlm'
+        dict with keys: 'model_core', 'embedding', 'layers', 'norm', 'lm_head', 'rotary_emb'
     """
-    model_type = getattr(hf_model.config, 'model_type', '')
+    # Find the inner model (model.model for most CausalLM wrappers)
+    model_core = hf_model.model if hasattr(hf_model, 'model') else hf_model
 
-    # === VLM Detection & Component Extraction ===
-    # VLM models wrap a language model + vision encoder + projector
-    # We need to find the language model first, then extract LLM components from it
-    VLM_CONFIGS = {
-        # model_type: (language_model_attr, vision_attrs, projector_attr)
-        'qwen2_vl':    ('model',          ['visual'],        'visual.merger'),
-        'qwen2_5_vl':  ('model',          ['visual'],        'visual.merger'),
-        'qwen3_vl':    ('model',          ['visual'],        'visual.merger'),
-        'qwen3_vl_moe':('model',          ['visual'],        'visual.merger'),
-        'qwen3_5':     ('model',          ['visual'],        'visual.merger'),
-        'qwen3_5_moe': ('model',          ['visual'],        'visual.merger'),
-        'llava':       ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'llava_next':  ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'llama4':      ('language_model',  ['vision_model'],  'multi_modal_projector'),
-        'gemma3':      ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'internvl':    ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'glm4v':       ('language_model',  ['visual'],        'visual.merger'),
-        'glm4v_moe':   ('language_model',  ['visual'],        'visual.merger'),
-        'minicpmv':    ('llm',             ['vpm'],           'resampler'),
-        'minicpmo':    ('llm',             ['vpm', 'apm'],    'resampler'),
-        'mllama':      ('language_model',  ['vision_model'],  'multi_modal_projector'),
-        'paligemma':   ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-    }
-
-    is_vlm = False
-    vision_encoder = None
-    projector = None
-    lm_root = hf_model  # For LLMs, search from the top-level model
-
-    # Check if this is a VLM by model_type or by presence of vision components
-    if model_type in VLM_CONFIGS:
-        lm_attr, vision_attrs, proj_attr = VLM_CONFIGS[model_type]
-
-        # Extract vision encoder (may be a single module or multiple sub-modules)
-        vision_parts = []
-        for va in vision_attrs:
-            v = hf_model
-            for key in va.split('.'):
-                v = getattr(v, key, None)
-                if v is None:
-                    break
-            if v is not None:
-                vision_parts.append(v)
-        if vision_parts:
-            # Wrap multiple vision parts in a ModuleList for unified handling
-            if len(vision_parts) == 1:
-                vision_encoder = vision_parts[0]
-            else:
-                vision_encoder = nn.ModuleList(vision_parts)
-            is_vlm = True
-            logger.info(f"VLM detected ({model_type}): vision_encoder from {vision_attrs}")
-
-        # Extract projector
-        p = hf_model
-        for key in proj_attr.split('.'):
-            p = getattr(p, key, None)
-            if p is None:
-                break
-        if p is not None:
-            projector = p
-            logger.info(f"VLM projector at: {proj_attr}")
-
-        # For VLMs, the language model is nested
-        lm_root = getattr(hf_model, lm_attr, hf_model)
-        if lm_root is hf_model:
-            logger.warning(f"VLM language model attr '{lm_attr}' not found, using top-level model")
-    elif hasattr(hf_model.config, 'vision_config'):
-        # Generic VLM detection via config
-        logger.info(f"Detected vision_config in model config, attempting VLM discovery")
-        for lm_attr in ['language_model', 'model', 'llm']:
-            candidate = getattr(hf_model, lm_attr, None)
-            if candidate is not None and hasattr(candidate, 'layers') or hasattr(candidate, 'model'):
-                lm_root = candidate
-                break
-        for va in ['vision_tower', 'visual', 'vision_model', 'vpm']:
-            v = getattr(hf_model, va, None)
-            if v is not None:
-                vision_encoder = v
-                is_vlm = True
-                logger.info(f"VLM vision_encoder found at: {va}")
-                break
-        for pa in ['multi_modal_projector', 'visual.merger', 'resampler']:
-            p = hf_model
-            for key in pa.split('.'):
-                p = getattr(p, key, None)
-                if p is None:
-                    break
-            if p is not None:
-                projector = p
-                logger.info(f"VLM projector found at: {pa}")
-                break
-
-    # === LLM Component Discovery (from lm_root) ===
-    # For VLMs, lm_root is the language model; for LLMs, it's the top-level model
-    model_core = getattr(lm_root, 'model', lm_root)
-
-    # Find embedding (search from both hf_model and lm_root for VLM compatibility)
+    # Find embedding
     EMBED_PATHS = [
         ('model', 'embed_tokens'), ('transformer', 'wte'),
         ('model', 'decoder', 'embed_tokens'), ('embed_tokens',),
     ]
     embedding = None
-    for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
-        for path in EMBED_PATHS:
-            obj = search_root
-            for attr in path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                embedding = obj
-                logger.info(f"Found embedding at: {'.'.join(path)}")
+    for path in EMBED_PATHS:
+        obj = hf_model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
                 break
-        if embedding is not None:
+        if obj is not None:
+            embedding = obj
+            logger.info(f"Found embedding at: {'.'.join(path)}")
             break
     if embedding is None:
         raise AttributeError("Could not find embedding layer")
 
-    # Find layers (search from lm_root for VLMs)
+    # Find layers
     LAYER_PATHS = [
         ('model', 'layers'), ('transformer', 'h'),
         ('model', 'decoder', 'layers'), ('decoder', 'layers'), ('layers',),
     ]
     layers = None
-    for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
-        for path in LAYER_PATHS:
-            obj = search_root
-            for attr in path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None and hasattr(obj, '__len__') and len(obj) > 0:
-                layers = list(obj)
-                logger.info(f"Found {len(layers)} layers at: {'.'.join(path)}")
+    for path in LAYER_PATHS:
+        obj = hf_model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
                 break
-        if layers is not None:
+        if obj is not None and hasattr(obj, '__len__') and len(obj) > 0:
+            layers = list(obj)
+            logger.info(f"Found {len(layers)} layers at: {'.'.join(path)}")
             break
     if layers is None:
         raise AttributeError("Could not find decoder layers")
 
-    # Find final norm (search from lm_root for VLMs)
+    # Find final norm
     NORM_PATHS = [
         ('model', 'norm'), ('transformer', 'ln_f'),
         ('model', 'decoder', 'final_layer_norm'), ('norm',),
     ]
     norm = None
-    for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
-        for path in NORM_PATHS:
-            obj = search_root
-            for attr in path:
-                obj = getattr(obj, attr, None)
-                if obj is None:
-                    break
-            if obj is not None:
-                norm = obj
-                logger.info(f"Found final_norm at: {'.'.join(path)}")
+    for path in NORM_PATHS:
+        obj = hf_model
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
                 break
-        if norm is not None:
+        if obj is not None:
+            norm = obj
+            logger.info(f"Found final_norm at: {'.'.join(path)}")
             break
 
-    # Find lm_head (search from lm_root and hf_model)
-    lm_head = None
-    for search_root in ([lm_root, hf_model] if is_vlm else [hf_model]):
-        lm_head = getattr(search_root, 'lm_head', None)
-        if lm_head is not None:
-            break
+    # Find lm_head
+    lm_head = getattr(hf_model, 'lm_head', None)
     if lm_head is None:
         lm_head = getattr(getattr(hf_model, 'transformer', None), 'lm_head', None)
     if lm_head is None:
@@ -249,9 +137,6 @@ def _discover_model_components(hf_model):
         'norm': norm,
         'lm_head': lm_head,
         'rotary_emb': rotary_emb,
-        'vision_encoder': vision_encoder,
-        'projector': projector,
-        'is_vlm': is_vlm,
     }
 
 
@@ -307,39 +192,23 @@ def _group_layers_by_structure(cpu_layers):
 class CPUMasterModel:
     """CPU master with explicit recompute - TRUE async pipeline.
 
-    Supports any HuggingFace decoder-only model and VLM. Handles:
+    Supports any HuggingFace decoder-only model. Handles:
     - Uniform layers (Llama, Qwen2, Mistral, etc.)
     - Hybrid attention (Qwen3.5 linear+full)
     - MoE layers (Mixtral, DeepSeek, Qwen3-Next)
-    - VLM (Qwen2-VL, Qwen3-VL, LLaVA, Gemma3-VL, InternVL, etc.)
     """
 
     def __init__(self, hf_model, config: CPUMasterConfig):
         self.config = config
         self.device = torch.device(f"cuda:{config.device}")
 
-        # === Discover model structure (model-agnostic, LLM + VLM) ===
+        # === Discover model structure (model-agnostic) ===
         components = _discover_model_components(hf_model)
 
-        # VLM components (CPU offloaded, not GPU-resident)
-        self.is_vlm = components['is_vlm']
-        self.vision_encoder = components.get('vision_encoder')
-        self.projector = components.get('projector')
-        if self.is_vlm:
-            if self.vision_encoder is not None:
-                self.vision_encoder = self.vision_encoder.cpu()
-            if self.projector is not None:
-                self.projector = self.projector.cpu()
-            # Store the original HF model reference for VLM-specific merge logic
-            self._hf_model_type = getattr(hf_model.config, 'model_type', '')
-            logger.info(f"VLM mode: vision_encoder + projector on CPU (offloaded)")
-        else:
-            self._hf_model_type = ''
+        self.vocab_size = hf_model.config.vocab_size
+        self.hidden_size = hf_model.config.hidden_size
 
-        # Get config from the text/language model config if available
-        cfg = getattr(hf_model.config, 'text_config', hf_model.config)
-        self.vocab_size = cfg.vocab_size
-        self.hidden_size = cfg.hidden_size
+        cfg = hf_model.config
         self.num_heads = cfg.num_attention_heads
         self.head_dim = cfg.hidden_size // cfg.num_attention_heads
 
@@ -708,114 +577,7 @@ class CPUMasterModel:
         """Wait for CPU worker to finish all gradient accumulation tasks."""
         self.grad_task_queue.join()
 
-    def _process_vision(self, pixel_values, **vision_kwargs):
-        """Process images through vision encoder + projector on GPU, then offload.
-
-        Both vision encoder and projector are loaded to GPU on-demand and
-        offloaded back to CPU after use, keeping GPU memory free for decoder layers.
-
-        Args:
-            pixel_values: Image tensor from processor
-            **vision_kwargs: Additional kwargs (image_grid_thw, etc.)
-
-        Returns:
-            image_embeds: Projected image embeddings on GPU [N_images, N_tokens, hidden_size]
-        """
-        if self.vision_encoder is None:
-            return None
-
-        # 1. Load vision encoder to GPU, process images
-        self.vision_encoder.to(self.device)
-        with torch.no_grad():
-            pv = pixel_values.to(self.device)
-            # Most vision encoders accept pixel_values directly
-            # Some (Qwen-VL) also need grid_thw
-            vkw = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                   for k, v in vision_kwargs.items()}
-            try:
-                image_features = self.vision_encoder(pv, **vkw)
-            except TypeError:
-                # Fallback: some encoders don't accept extra kwargs
-                image_features = self.vision_encoder(pv)
-            # Handle tuple output (some encoders return (hidden_states, ...))
-            if isinstance(image_features, tuple):
-                image_features = image_features[0]
-        self.vision_encoder.cpu()
-        torch.cuda.empty_cache()
-        logger.debug(f"Vision encoder done, features shape: {image_features.shape}")
-
-        # 2. Load projector to GPU, project features
-        if self.projector is not None:
-            self.projector.to(self.device)
-            with torch.no_grad():
-                image_embeds = self.projector(image_features)
-            self.projector.cpu()
-            torch.cuda.empty_cache()
-        else:
-            image_embeds = image_features
-
-        logger.debug(f"Projector done, embeds shape: {image_embeds.shape}")
-        return image_embeds
-
-    def _merge_vision_embeddings(self, hidden, image_embeds, input_ids):
-        """Merge image embeddings into text hidden states at image token positions.
-
-        Replaces hidden states at positions where input_ids match the image token
-        with the projected image embeddings.
-
-        Args:
-            hidden: Text embeddings [B, T, H]
-            image_embeds: Image embeddings [N_img_tokens, H] or [B, N_img_tokens, H]
-            input_ids: Input token IDs [B, T] (on GPU)
-
-        Returns:
-            Merged hidden states [B, T, H]
-        """
-        # Find image token positions
-        # Common image token IDs across models
-        IMAGE_TOKEN_IDS = set()
-        # Try to get from model config
-        for attr in ['image_token_id', 'vision_start_token_id']:
-            tid = getattr(self.config, attr, None)
-            if tid is not None:
-                IMAGE_TOKEN_IDS.add(tid)
-
-        if not IMAGE_TOKEN_IDS:
-            # Fallback: scan for token ID that appears repeatedly and matches image embed count
-            # This is a heuristic; specific models may need specific handling
-            n_img_tokens = image_embeds.shape[-2] if image_embeds.dim() == 3 else image_embeds.shape[0]
-            for candidate_id in range(151643, 151660):  # Qwen-VL image token range
-                mask = (input_ids == candidate_id)
-                if mask.sum() > 0:
-                    IMAGE_TOKEN_IDS.add(candidate_id)
-                    break
-
-        if not IMAGE_TOKEN_IDS:
-            # If we can't find image tokens, prepend image embeddings
-            logger.warning("Could not find image token positions, prepending image embeddings")
-            if image_embeds.dim() == 2:
-                image_embeds = image_embeds.unsqueeze(0).expand(hidden.shape[0], -1, -1)
-            # This is a simplistic fallback; real models handle this in their own forward
-            return hidden
-
-        # Replace image token positions with image embeddings
-        merged = hidden.clone()
-        img_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for tid in IMAGE_TOKEN_IDS:
-            img_mask |= (input_ids == tid)
-
-        # Flatten and replace
-        if img_mask.sum() > 0 and image_embeds.numel() > 0:
-            flat_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
-            n_positions = img_mask.sum().item()
-            n_available = flat_embeds.shape[0]
-            n_use = min(n_positions, n_available)
-            merged[img_mask][:n_use] = flat_embeds[:n_use]
-
-        return merged
-
-    def forward_and_backward(self, input_ids, attention_mask, labels,
-                              pixel_values=None, **vision_kwargs):
+    def forward_and_backward(self, input_ids, attention_mask, labels):
         B, T = input_ids.shape
 
         self.compute_stream.wait_event(self.param_sync_event)
@@ -826,20 +588,8 @@ class CPUMasterModel:
         start.record()
 
         # === FORWARD ===
-
-        # === VLM: Process images first (vision encoder + projector on GPU, then offload) ===
-        image_embeds = None
-        if self.is_vlm and pixel_values is not None:
-            image_embeds = self._process_vision(pixel_values, **vision_kwargs)
-
         input_ids_gpu = input_ids.to(self.device)
         hidden = self.emb_gpu(input_ids_gpu)
-
-        # Merge image embeddings into hidden states at image token positions
-        if image_embeds is not None:
-            hidden = self._merge_vision_embeddings(hidden, image_embeds, input_ids_gpu)
-            del image_embeds
-
         del input_ids_gpu
 
         # Position info (model-agnostic)
@@ -1117,28 +867,10 @@ class CPUMasterModel:
             'total': total_time,
         }
 
-    def get_parameters(self, include_vision=False):
-        """Get all parameters, deduplicated by object id to avoid double-optimizing tied weights.
-
-        Args:
-            include_vision: If True, include vision encoder parameters (default: False,
-                           as vision encoder is typically frozen during VLM fine-tuning)
-        """
+    def get_parameters(self):
+        """Get all parameters, deduplicated by object id to avoid double-optimizing tied weights."""
         seen = set()
         params = []
-
-        # VLM: optionally include vision encoder and projector
-        if self.is_vlm and include_vision and self.vision_encoder is not None:
-            for p in self.vision_encoder.parameters():
-                if id(p) not in seen:
-                    params.append(p)
-                    seen.add(id(p))
-
-        if self.is_vlm and self.projector is not None:
-            for p in self.projector.parameters():
-                if id(p) not in seen:
-                    params.append(p)
-                    seen.add(id(p))
 
         for p in self.embedding.parameters():
             if id(p) not in seen:

@@ -65,20 +65,9 @@ python examples/train.py --config examples/configs/qwen3_5_27b.yaml
 | [Yi 1.5](https://huggingface.co/01-ai) | 6B/9B/34B | Dense |
 | [Baichuan 2](https://huggingface.co/baichuan-inc) | 7B/13B | Dense |
 | [GPT-OSS](https://huggingface.co/openai) | 20B/120B | Dense |
-| **Vision-Language Models (VLM)** | | |
-| [Qwen2-VL/Qwen2.5-VL](https://huggingface.co/Qwen) | 2B/7B/72B | VLM (ViT + LLM) |
-| [Qwen3-VL](https://huggingface.co/Qwen) | 2B/4B/8B/32B | VLM (ViT + LLM) |
-| [Qwen3.5-VL](https://huggingface.co/Qwen) | 7B+ | VLM (ViT + Hybrid LLM) |
-| [LLaVA/LLaVA-NeXT](https://huggingface.co/llava-hf) | 7B/13B/34B | VLM |
-| [InternVL 2/2.5](https://huggingface.co/OpenGVLab) | 2B/8B/26B/76B | VLM |
-| [Gemma 3 VL](https://huggingface.co/google) | 4B/12B/27B | VLM |
-| [GLM-4V](https://huggingface.co/THUDM) | 9B | VLM |
-| [MiniCPM-V](https://huggingface.co/openbmb) | 2B/8B | VLM |
-| [Llama 4 VL](https://huggingface.co/meta-llama) | Scout/Maverick | VLM + MoE |
 | Any HF decoder-only model | Any size | Auto-detected |
-| Any HF VLM model | Any size | Auto-detected |
 
-> MegaTrain uses HuggingFace's `AutoModelForCausalLM` / `AutoModelForImageTextToText` with automatic model structure discovery. Both LLM and VLM models are supported without code changes. Vision encoders are CPU-offloaded just like decoder layers — GPU only holds what's currently computing.
+> MegaTrain uses HuggingFace's `AutoModelForCausalLM` with automatic model structure discovery. Any decoder-only transformer model is supported without code changes.
 
 ## Data Preparation
 

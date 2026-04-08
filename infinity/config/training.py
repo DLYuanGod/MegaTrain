@@ -53,10 +53,6 @@ class CPUMasterConfig:
     query_field: str = "query"
     response_field: str = "response"
 
-    # VLM
-    freeze_vision_encoder: bool = True
-    freeze_projector: bool = False
-
     # Training
     batch_size: int = 96
     gradient_accumulation_steps: int = 1
