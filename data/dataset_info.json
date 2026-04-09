@@ -68,5 +68,33 @@
       "user_tag": "user",
       "assistant_tag": "assistant"
     }
+  },
+  "llava_instruct_150k": {
+    "hf_hub_url": "liuhaotian/LLaVA-Instruct-150K",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt"
+    }
+  },
+  "sharegpt4v": {
+    "hf_hub_url": "Lin-Chen/ShareGPT4V",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "images": "image"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "gpt"
+    }
   }
 }

@@ -73,23 +73,24 @@ def _discover_model_components(hf_model):
     # We need to find the language model first, then extract LLM components from it
     VLM_CONFIGS = {
         # model_type: (language_model_attr, vision_attrs, projector_attr)
-        'qwen2_vl':    ('model',          ['visual'],        'visual.merger'),
-        'qwen2_5_vl':  ('model',          ['visual'],        'visual.merger'),
-        'qwen3_vl':    ('model',          ['visual'],        'visual.merger'),
-        'qwen3_vl_moe':('model',          ['visual'],        'visual.merger'),
-        'qwen3_5':     ('model',          ['visual'],        'visual.merger'),
-        'qwen3_5_moe': ('model',          ['visual'],        'visual.merger'),
-        'llava':       ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'llava_next':  ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'llama4':      ('language_model',  ['vision_model'],  'multi_modal_projector'),
-        'gemma3':      ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'internvl':    ('language_model',  ['vision_tower'],  'multi_modal_projector'),
-        'glm4v':       ('language_model',  ['visual'],        'visual.merger'),
-        'glm4v_moe':   ('language_model',  ['visual'],        'visual.merger'),
-        'minicpmv':    ('llm',             ['vpm'],           'resampler'),
-        'minicpmo':    ('llm',             ['vpm', 'apm'],    'resampler'),
-        'mllama':      ('language_model',  ['vision_model'],  'multi_modal_projector'),
-        'paligemma':   ('language_model',  ['vision_tower'],  'multi_modal_projector'),
+        # language_model_attr: dot-separated path from hf_model to the language model root
+        'qwen2_vl':    ('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'qwen2_5_vl':  ('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'qwen3_vl':    ('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'qwen3_vl_moe':('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'qwen3_5':     ('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'qwen3_5_moe': ('model.language_model',  ['model.visual'],  'model.visual.merger'),
+        'llava':       ('language_model',         ['vision_tower'],  'multi_modal_projector'),
+        'llava_next':  ('language_model',         ['vision_tower'],  'multi_modal_projector'),
+        'llama4':      ('language_model',         ['vision_model'],  'multi_modal_projector'),
+        'gemma3':      ('language_model',         ['vision_tower'],  'multi_modal_projector'),
+        'internvl':    ('language_model',         ['vision_tower'],  'multi_modal_projector'),
+        'glm4v':       ('language_model',         ['visual'],        'visual.merger'),
+        'glm4v_moe':   ('language_model',         ['visual'],        'visual.merger'),
+        'minicpmv':    ('llm',                    ['vpm'],           'resampler'),
+        'minicpmo':    ('llm',                    ['vpm', 'apm'],    'resampler'),
+        'mllama':      ('language_model',         ['vision_model'],  'multi_modal_projector'),
+        'paligemma':   ('language_model',         ['vision_tower'],  'multi_modal_projector'),
     }
 
     is_vlm = False
@@ -101,7 +102,7 @@ def _discover_model_components(hf_model):
     if model_type in VLM_CONFIGS:
         lm_attr, vision_attrs, proj_attr = VLM_CONFIGS[model_type]
 
-        # Extract vision encoder (may be a single module or multiple sub-modules)
+        # Extract vision encoder (may be dot-separated paths)
         vision_parts = []
         for va in vision_attrs:
             v = hf_model
@@ -130,9 +131,14 @@ def _discover_model_components(hf_model):
             projector = p
             logger.info(f"VLM projector at: {proj_attr}")
 
-        # For VLMs, the language model is nested
-        lm_root = getattr(hf_model, lm_attr, hf_model)
-        if lm_root is hf_model:
+        # For VLMs, the language model is nested (may be dot-separated path)
+        lm_root = hf_model
+        for key in lm_attr.split('.'):
+            lm_root = getattr(lm_root, key, None)
+            if lm_root is None:
+                break
+        if lm_root is None:
+            lm_root = hf_model
             logger.warning(f"VLM language model attr '{lm_attr}' not found, using top-level model")
     elif hasattr(hf_model.config, 'vision_config'):
         # Generic VLM detection via config
@@ -849,10 +855,19 @@ class CPUMasterModel:
         # Compute position_embeddings if model has model-level rotary_emb
         position_embeddings = None
         if self.rotary_gpu and self.layer_accepts_position_embeddings:
-            dummy = torch.empty((1, 1, T, self.head_dim), device=self.device, dtype=torch.float32)
-            cos, sin = self.rotary_gpu(dummy, position_ids[:1])
-            position_embeddings = (cos.to(self.config.dtype), sin.to(self.config.dtype))
-            del dummy
+            if self.is_vlm:
+                # VLM models (e.g., Qwen2.5-VL) use M-RoPE with 3D position_ids [3, B, T]
+                # For text-only input, use simple sequential positions for all 3 dims
+                pos_3d = torch.arange(T, device=self.device).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
+                dummy = torch.empty((1, 1, T, self.head_dim), device=self.device, dtype=torch.float32)
+                cos, sin = self.rotary_gpu(dummy, pos_3d)
+                position_embeddings = (cos.to(self.config.dtype), sin.to(self.config.dtype))
+                del dummy, pos_3d
+            else:
+                dummy = torch.empty((1, 1, T, self.head_dim), device=self.device, dtype=torch.float32)
+                cos, sin = self.rotary_gpu(dummy, position_ids[:1])
+                position_embeddings = (cos.to(self.config.dtype), sin.to(self.config.dtype))
+                del dummy
 
         # Attention mask: pass as-is (2D), let HF layers handle 4D expansion
         mask = attention_mask.to(self.device)

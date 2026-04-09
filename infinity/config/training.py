@@ -52,6 +52,7 @@ class CPUMasterConfig:
     system_prompt: str = ""
     query_field: str = "query"
     response_field: str = "response"
+    train_on_prompt: bool = False
 
     # VLM
     freeze_vision_encoder: bool = True

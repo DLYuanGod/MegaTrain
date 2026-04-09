@@ -69,6 +69,11 @@ def yaml_to_training_config(yaml_config: Dict[str, Any]) -> CPUMasterConfig:
         system_prompt=dataset_cfg.get('system_prompt', ''),
         query_field=dataset_cfg.get('query_field', 'query'),
         response_field=dataset_cfg.get('response_field', 'response'),
+        train_on_prompt=dataset_cfg.get('train_on_prompt', False),
+
+        # VLM
+        freeze_vision_encoder=yaml_config.get('vlm', {}).get('freeze_vision_encoder', True),
+        freeze_projector=yaml_config.get('vlm', {}).get('freeze_projector', False),
 
         # Training
         batch_size=training_cfg.get('batch_size', 96),

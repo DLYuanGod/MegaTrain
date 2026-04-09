@@ -181,20 +181,25 @@ def main():
         )
 
     # Setup dataset (universal: uses tokenizer's native chat template)
+    dataset_kwargs = dict(
+        system_prompt=config.system_prompt if config.system_prompt else None,
+        train_on_prompt=config.train_on_prompt,
+        processor=processor,
+    )
     if config.dataset_name:
         dataset = ChatDataset(
             tokenizer, config.max_seq_len,
             dataset_name=config.dataset_name,
             dataset_dir=config.dataset_dir,
-            system_prompt=config.system_prompt if config.system_prompt else None,
+            **dataset_kwargs,
         )
     else:
         dataset = ChatDataset(
             tokenizer, config.max_seq_len,
             dataset_path=config.dataset_path,
-            system_prompt=config.system_prompt if config.system_prompt else None,
             query_field=config.query_field,
             response_field=config.response_field,
+            **dataset_kwargs,
         )
     dataloader = DataLoader(dataset, batch_size=config.batch_size, collate_fn=collate_fn, num_workers=num_workers)
     data_iter = iter(dataloader)
