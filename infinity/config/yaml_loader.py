@@ -52,11 +52,15 @@ def yaml_to_training_config(yaml_config: Dict[str, Any]) -> CPUMasterConfig:
     }
     dtype = dtype_map.get(dtype_str, torch.bfloat16)
 
+    # Multi-GPU: read devices list, fall back to [device]
+    devices = model_cfg.get('devices', [model_cfg.get('device', 0)])
+
     # Create CPUMasterConfig
     config = CPUMasterConfig(
         # Model
         model_name=model_cfg.get('name', 'Qwen/Qwen2.5-32B-Instruct'),
         device=model_cfg.get('device', 0),
+        devices=devices,
         dtype=dtype,
         attn_implementation=model_cfg.get('attn_implementation', 'flash_attention_2'),
         trust_remote_code=model_cfg.get('trust_remote_code', True),
