@@ -448,6 +448,19 @@ class CPUMasterModel:
 
         # Max layer size (for buffer allocation)
         self.max_layer_numel = max(self.layer_numels)
+
+        # Pre-flattened pinned buffers (single-GPU only).
+        # Multi-GPU uses shared-memory flats instead (created in SharedState).
+        self.layer_pinned_flats = []
+        if config.world_size == 1:
+            for i, layer in enumerate(self.cpu_layers):
+                flat = torch.empty(self.layer_numels[i], dtype=config.dtype).pin_memory()
+                offset = 0
+                for p in layer.parameters():
+                    numel = p.numel()
+                    flat[offset:offset + numel].copy_(p.data.flatten())
+                    offset += numel
+                self.layer_pinned_flats.append(flat)
         self.min_layer_numel = min(self.layer_numels)
 
         if self.max_layer_numel != self.min_layer_numel:
@@ -463,29 +476,63 @@ class CPUMasterModel:
 
         # === Create per-GPU contexts ===
         self._model_config = hf_model.config
-        self.gpu_contexts = []
+        self.use_multiprocessing = config.world_size > 1
 
-        # CPU worker thread for async gradient accumulation (shared across all GPUs)
+        if self.use_multiprocessing:
+            self._init_multiprocessing(config)
+        else:
+            self._init_single_gpu(config)
+
+        logger.info(f"Model: {len(self.cpu_layers)} layers, checkpoint every {config.checkpoint_interval}")
+        logger.info(f"Mode: {'multiprocessing' if self.use_multiprocessing else 'single-GPU'}")
+        logger.info(f"GPUs: {config.world_size} ({config.devices})")
+        logger.info(f"Max flattened param size per layer: {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
+        logger.info(f"Layer groups: {len(self.layer_groups)}")
+
+    def _init_single_gpu(self, config):
+        """Initialize for single-GPU mode (threading, no multiprocessing)."""
+        self.gpu_contexts = []
+        self.shared_state = None
+        self.worker_processes = []
+
+        # CPU worker thread for async gradient accumulation
         self.grad_task_queue = queue.Queue()
         self.worker_stop = threading.Event()
         self.worker_thread = threading.Thread(target=self._grad_worker, daemon=True)
         self.worker_thread.start()
 
-        for gpu_idx, device_id in enumerate(config.devices):
-            ctx = self._create_gpu_context(gpu_idx, device_id)
-            self.gpu_contexts.append(ctx)
+        ctx = self._create_gpu_context(0, config.devices[0])
+        self.gpu_contexts.append(ctx)
+        self.device = ctx.device
 
-        # Backward compat: expose first GPU's device for external code
-        self.device = self.gpu_contexts[0].device
+    def _init_multiprocessing(self, config):
+        """Initialize for multi-GPU mode with torch.multiprocessing (spawn)."""
+        from infinity.model.mp_state import SharedState, _mp_ctx
+        from infinity.model.mp_worker import gpu_worker_fn
 
-        logger.info(f"Model: {len(self.cpu_layers)} layers, checkpoint every {config.checkpoint_interval}")
-        logger.info(f"GPUs: {len(self.gpu_contexts)} ({[str(ctx.device) for ctx in self.gpu_contexts]})")
-        logger.info(f"Max flattened param size per layer: {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
-        logger.info(f"Layer groups: {len(self.layer_groups)}")
-        logger.info(f"Gradient slab pools (per GPU):")
-        logger.info(f"  - Layer slabs: {config.num_grad_slabs} x {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
-        logger.info(f"  - Head slab: 1 x {self.head_total_numel * config.dtype.itemsize / 1024**2:.2f} MB")
-        logger.info(f"  - Embed slab: 1 x {self.embed_total_numel * config.dtype.itemsize / 1024**2:.2f} MB")
+        self.gpu_contexts = []
+        self.grad_task_queue = None
+        self.worker_stop = None
+        self.worker_thread = None
+
+        # Create shared state (shared-memory weight flats + grad accumulators)
+        # This also moves all CPU module params to shared memory for spawn pickling
+        self.shared_state = SharedState(self, config)
+
+        # Expose first device for external code (GPU memory stats etc.)
+        self.device = torch.device(f"cuda:{config.devices[0]}")
+
+        # Spawn worker processes (spawn context avoids CUDA fork guard)
+        self.worker_processes = []
+        for rank in range(config.world_size):
+            p = _mp_ctx.Process(
+                target=gpu_worker_fn,
+                args=(rank, self.shared_state),
+                daemon=True,
+            )
+            p.start()
+            self.worker_processes.append(p)
+            logger.info(f"Spawned worker {rank} (pid={p.pid}) on cuda:{config.devices[rank]}")
 
     def _create_gpu_context(self, gpu_idx, device_id):
         """Create a _GPUContext with all per-GPU resources for one device."""
@@ -640,43 +687,64 @@ class CPUMasterModel:
             self.grad_task_queue.task_done()
 
     def _sync_params_to_gpu(self):
-        """Sync CPU master params to all GPU modules (call after optimizer step)."""
-        for ctx in self.gpu_contexts:
-            for p_gpu, p_cpu in zip(ctx.emb_gpu.parameters(), self.embedding.parameters()):
-                p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+        """Sync CPU master params to all GPU modules (call after optimizer step).
 
-            if ctx.norm_gpu:
-                for p_gpu, p_cpu in zip(ctx.norm_gpu.parameters(), self.norm.parameters()):
+        Also refreshes the pre-flattened pinned buffers so the next
+        forward pass loads the updated weights.
+        """
+        if self.use_multiprocessing:
+            # Multi-GPU: update shared-memory flats, then tell workers to sync
+            from infinity.model.mp_state import WorkerCommand, WorkerCommandType
+            self.shared_state.update_shared_flats()
+            for i in range(self.world_size):
+                self.shared_state.cmd_queues[i].put(
+                    WorkerCommand(type=WorkerCommandType.SYNC_WEIGHTS))
+            for i in range(self.world_size):
+                self.shared_state.result_queues[i].get()  # wait for sync done
+        else:
+            # Single-GPU: refresh pinned flats + GPU modules directly
+            for i, layer in enumerate(self.cpu_layers):
+                flat = self.layer_pinned_flats[i]
+                offset = 0
+                for p in layer.parameters():
+                    numel = p.numel()
+                    flat[offset:offset + numel].copy_(p.data.flatten())
+                    offset += numel
+
+            for ctx in self.gpu_contexts:
+                for p_gpu, p_cpu in zip(ctx.emb_gpu.parameters(), self.embedding.parameters()):
                     p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-            if not self.tied_lm_head:
-                for p_gpu, p_cpu in zip(ctx.lm_head_gpu.parameters(), self.lm_head.parameters()):
-                    p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+                if ctx.norm_gpu:
+                    for p_gpu, p_cpu in zip(ctx.norm_gpu.parameters(), self.norm.parameters()):
+                        p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-            if ctx.rotary_gpu:
-                for p_gpu, p_cpu in zip(ctx.rotary_gpu.parameters(), self.rotary_emb.parameters()):
-                    p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+                if not self.tied_lm_head:
+                    for p_gpu, p_cpu in zip(ctx.lm_head_gpu.parameters(), self.lm_head.parameters()):
+                        p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-            ctx.param_sync_event.record(torch.cuda.current_stream(ctx.device))
+                if ctx.rotary_gpu:
+                    for p_gpu, p_cpu in zip(ctx.rotary_gpu.parameters(), self.rotary_emb.parameters()):
+                        p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+
+                ctx.param_sync_event.record(torch.cuda.current_stream(ctx.device))
 
     def _load_layer_to_buffer_async(self, layer_idx, buffer_idx, ctx):
-        """Load CPU layer params to GPU buffer asynchronously."""
+        """Load CPU layer params to GPU buffer asynchronously.
+
+        Uses pre-flattened pinned buffers (self.layer_pinned_flats) so
+        the only work here is a single async pinned→GPU DMA transfer.
+        No per-parameter CPU copy loop, no GIL contention.
+        """
         ctx.h2d_done_events[buffer_idx].synchronize()
         ctx.weight_stream.wait_event(ctx.buffer_free_events[buffer_idx])
 
-        cpu_flat = ctx.cpu_flat_buffers[buffer_idx]
-        layer = self.cpu_layers[layer_idx]
+        pinned_flat = self.layer_pinned_flats[layer_idx]
         layer_numel = self.layer_numels[layer_idx]
-
-        offset = 0
-        for p in layer.parameters():
-            numel = p.numel()
-            cpu_flat[offset:offset + numel].copy_(p.data.flatten())
-            offset += numel
 
         with torch.cuda.stream(ctx.weight_stream):
             ctx.gpu_flat_buffers[buffer_idx][:layer_numel].copy_(
-                cpu_flat[:layer_numel], non_blocking=True
+                pinned_flat, non_blocking=True
             )
             ctx.weight_ready_events[buffer_idx].record(ctx.weight_stream)
             ctx.h2d_done_events[buffer_idx].record(ctx.weight_stream)
@@ -1205,86 +1273,89 @@ class CPUMasterModel:
                               pixel_values=None, **vision_kwargs):
         """Run forward + backward across all GPUs with data parallelism.
 
-        Splits the batch across GPUs, runs forward/backward concurrently via
-        threading, accumulates gradients, and averages by world_size.
+        Single-GPU: direct call to _forward_and_backward_single_gpu.
+        Multi-GPU: dispatches work to forked worker processes via queues.
         """
         world_size = self.world_size
 
         if world_size == 1:
-            # Fast path: no threading overhead
+            # Single-GPU path: direct call, no multiprocessing
             loss_val, total_tokens, timing, _ = self._forward_and_backward_single_gpu(
                 self.gpu_contexts[0], input_ids, attention_mask, labels,
                 pixel_values=pixel_values, **vision_kwargs)
             self._accumulate_grads_batch()
             return loss_val, total_tokens, timing
 
-        # Pre-compute global valid token count from labels (before splitting)
+        # Multi-GPU path: dispatch to worker processes
+        return self._forward_and_backward_multiprocess(
+            input_ids, attention_mask, labels,
+            pixel_values=pixel_values, **vision_kwargs)
+
+    def _forward_and_backward_multiprocess(self, input_ids, attention_mask, labels,
+                                            pixel_values=None, **vision_kwargs):
+        """Multi-GPU forward/backward via forked worker processes."""
+        from infinity.model.mp_state import WorkerCommand, WorkerCommandType
+
+        world_size = self.world_size
         global_valid_tokens = int((labels != -100).sum().item())
 
-        # Split batch across GPUs
+        # Split batch across workers
         B = input_ids.shape[0]
         per_gpu = B // world_size
         id_chunks = input_ids.split(per_gpu)
         mask_chunks = attention_mask.split(per_gpu)
         label_chunks = labels.split(per_gpu)
 
-        # Split vision kwargs if present
-        vision_chunks = [{} for _ in range(world_size)]
-        if pixel_values is not None:
-            pv_chunks = pixel_values.split(per_gpu)
-            for i in range(world_size):
-                vision_chunks[i]['pixel_values'] = pv_chunks[i]
-            for k, v in vision_kwargs.items():
-                if isinstance(v, torch.Tensor) and v.shape[0] == B:
-                    v_chunks = v.split(per_gpu)
-                    for i in range(world_size):
-                        vision_chunks[i][k] = v_chunks[i]
-                else:
-                    for i in range(world_size):
-                        vision_chunks[i][k] = v
+        # Send commands FIRST — workers start H2D immediately
+        for i in range(world_size):
+            pv = None
+            vkw = None
+            if pixel_values is not None:
+                pv_chunks = pixel_values.split(per_gpu)
+                pv = pv_chunks[i]
+                vkw = {}
+                for k, v in vision_kwargs.items():
+                    if isinstance(v, torch.Tensor) and v.shape[0] == B:
+                        vkw[k] = v.split(per_gpu)[i]
+                    else:
+                        vkw[k] = v
 
-        results = [None] * world_size
-        errors = [None] * world_size
+            cmd = WorkerCommand(
+                type=WorkerCommandType.FORWARD_BACKWARD,
+                input_ids=id_chunks[i],
+                attention_mask=mask_chunks[i],
+                labels=label_chunks[i],
+                global_valid_tokens=global_valid_tokens,
+                pixel_values=pv,
+                vision_kwargs=vkw,
+            )
+            self.shared_state.cmd_queues[i].put(cmd)
 
-        def run_gpu(gpu_idx):
-            try:
-                pv = vision_chunks[gpu_idx].pop('pixel_values', None)
-                results[gpu_idx] = self._forward_and_backward_single_gpu(
-                    self.gpu_contexts[gpu_idx],
-                    id_chunks[gpu_idx], mask_chunks[gpu_idx], label_chunks[gpu_idx],
-                    pixel_values=pv, global_valid_tokens=global_valid_tokens,
-                    **vision_chunks[gpu_idx])
-            except Exception as e:
-                errors[gpu_idx] = e
+        # Zero shared grads while workers are doing H2D + forward (overlapped).
+        # Workers don't touch grads until backward, hundreds of ms from now.
+        for p in self.get_parameters():
+            if p.grad is not None:
+                p.grad.zero_()
 
-        threads = [threading.Thread(target=run_gpu, args=(i,)) for i in range(world_size)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        # Collect results from all workers
+        results = []
+        for i in range(world_size):
+            result = self.shared_state.result_queues[i].get()
+            results.append(result)
 
-        for i, e in enumerate(errors):
-            if e is not None:
-                raise RuntimeError(f"GPU {i} failed: {e}") from e
+        # Grads are already accumulated in shared p.grad by worker grad_workers
+        # (no _accumulate_grads_batch needed)
 
-        # Wait for all gradient tasks from all GPUs
-        self._accumulate_grads_batch()
-
-        # No post-hoc gradient scaling needed. Each GPU backwards
-        # loss = local_sum_loss / global_valid_tokens, so the 1/N scaling
-        # happens in float32 inside autograd. The grad worker sums across GPUs:
-        # accumulated = sum_i(d(local_sum_i / N_global)/d(params))
-        #             = d(total_sum / N_global)/d(params)
-        # which is exactly what single-GPU computes.
-
-        # Aggregate loss (weighted by valid tokens per GPU)
-        total_valid = sum(r[3] for r in results)
-        total_loss_sum = sum(r[0] * r[3] for r in results)  # loss_val * valid_tokens
-        total_tokens = sum(r[1] for r in results)
+        # Aggregate loss (weighted by valid tokens)
+        total_valid = sum(r.valid_tokens for r in results)
+        total_loss_sum = sum(r.loss_val * r.valid_tokens for r in results)
+        total_tokens = sum(r.total_tokens for r in results)
         avg_loss = total_loss_sum / total_valid if total_valid > 0 else 0.0
 
-        # Timing: take max across GPUs (wall-clock bound)
-        timing = {k: max(r[2].get(k, 0) for r in results) for k in results[0][2]}
+        # Timing: take max across workers (wall-clock bound)
+        timing = {}
+        if results[0].timing:
+            timing = {k: max(r.timing.get(k, 0) for r in results) for k in results[0].timing}
 
         return avg_loss, total_tokens, timing
 
@@ -1341,12 +1412,24 @@ class CPUMasterModel:
                 p.grad.zero_()
 
     def cleanup(self):
-        """Stop worker thread and cleanup resources."""
-        self.worker_stop.set()
-        self.worker_thread.join(timeout=5.0)
-        # Clear GPU contexts
-        for ctx in self.gpu_contexts:
-            del ctx.gpu_layer_templates
-            del ctx.gpu_flat_buffers, ctx.cpu_flat_buffers
-            del ctx.emb_gpu, ctx.norm_gpu, ctx.lm_head_gpu, ctx.rotary_gpu
-        self.gpu_contexts.clear()
+        """Stop workers and cleanup resources."""
+        if self.use_multiprocessing:
+            # Send shutdown to all workers
+            from infinity.model.mp_state import WorkerCommand, WorkerCommandType
+            for i in range(self.world_size):
+                self.shared_state.cmd_queues[i].put(
+                    WorkerCommand(type=WorkerCommandType.SHUTDOWN))
+            for p in self.worker_processes:
+                p.join(timeout=10.0)
+                if p.is_alive():
+                    p.kill()
+        else:
+            if self.worker_stop:
+                self.worker_stop.set()
+            if self.worker_thread:
+                self.worker_thread.join(timeout=5.0)
+            for ctx in self.gpu_contexts:
+                del ctx.gpu_layer_templates
+                del ctx.gpu_flat_buffers, ctx.cpu_flat_buffers
+                del ctx.emb_gpu, ctx.norm_gpu, ctx.lm_head_gpu, ctx.rotary_gpu
+            self.gpu_contexts.clear()
