@@ -1,0 +1,29 @@
+model:
+  name: "google/gemma-4-31B-it"
+  dtype: "bfloat16"
+  devices: [0, 1, 2, 3, 4, 5]
+  attn_implementation: "flash_attention_2"
+
+dataset:
+  name: "alpaca_en_demo"
+  max_seq_len: 512
+
+training:
+  batch_size: 6
+  gradient_accumulation_steps: 1
+  num_steps: 50
+  learning_rate: 5.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+
+optimizer:
+  type: "deepspeed_adam"
+
+memory:
+  checkpoint_interval: 2
+  num_grad_slabs: 8
+
+logging:
+  log_interval: 1
+  enable_timing: true

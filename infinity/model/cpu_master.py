@@ -310,6 +310,41 @@ def _group_layers_by_structure(cpu_layers):
     return layer_groups, layer_to_group
 
 
+class _GPUContext:
+    """Holds all per-GPU state for multi-GPU data parallelism.
+
+    Each GPU gets its own context with independent buffers, streams, events,
+    layer templates, and gradient slabs. The CPU master weights and optimizer
+    states are shared across all contexts.
+    """
+
+    __slots__ = [
+        'gpu_idx', 'device',
+        # Double-buffered flat buffers
+        'gpu_flat_buffers', 'cpu_flat_buffers',
+        # GPU layer templates per structure group
+        'gpu_layer_templates',
+        # GPU-resident modules
+        'emb_gpu', 'norm_gpu', 'lm_head_gpu', 'rotary_gpu',
+        # CUDA streams
+        'compute_stream', 'weight_stream', 'grad_stream',
+        # Synchronization events (double-buffered)
+        'weight_ready_events', 'h2d_done_events', 'backward_done_events',
+        'buffer_busy_events', 'buffer_free_events', 'template_free_events',
+        'param_sync_event', 'loss_backward_done', 'embedding_backward_done',
+        # K-slab gradient pool
+        'layer_grad_slabs', 'layer_slab_events', 'layer_slab_free_list',
+        'head_grad_slab', 'head_slab_event', 'head_slab_free',
+        'embed_grad_slab', 'embed_slab_event', 'embed_slab_free',
+        # Flash CE loss
+        'ce_loss',
+    ]
+
+    def __init__(self, gpu_idx, device):
+        self.gpu_idx = gpu_idx
+        self.device = device
+
+
 class CPUMasterModel:
     """CPU master with explicit recompute - TRUE async pipeline.
 
@@ -318,11 +353,15 @@ class CPUMasterModel:
     - Hybrid attention (Qwen3.5 linear+full)
     - MoE layers (Mixtral, DeepSeek, Qwen3-Next)
     - VLM (Qwen2-VL, Qwen3-VL, LLaVA, Gemma3-VL, InternVL, etc.)
+
+    Multi-GPU data parallelism: when config.devices has multiple GPUs,
+    each GPU gets its own _GPUContext. Forward/backward runs concurrently
+    on all GPUs via threading, with gradients accumulated to shared CPU params.
     """
 
     def __init__(self, hf_model, config: CPUMasterConfig):
         self.config = config
-        self.device = torch.device(f"cuda:{config.device}")
+        self.world_size = config.world_size
 
         # === Discover model structure (model-agnostic, LLM + VLM) ===
         components = _discover_model_components(hf_model)
@@ -422,163 +461,162 @@ class CPUMasterModel:
 
         self.embed_total_numel = sum(p.numel() for p in self.embedding.parameters())
 
-        # === Double-buffered CPU flat buffers (pinned, sized for max layer) ===
-        self.cpu_flat_buffers = [
-            torch.empty(self.max_layer_numel, dtype=config.dtype).pin_memory(),
-            torch.empty(self.max_layer_numel, dtype=config.dtype).pin_memory()
-        ]
-
-        # === Double-buffered GPU flat params ===
-        self.gpu_flat_buffers = [
-            torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device),
-            torch.empty(self.max_layer_numel, dtype=config.dtype, device=self.device)
-        ]
-
-        # === GPU layer templates (per structure group, double buffered) ===
-        # CRITICAL: Preserve _attn_implementation when moving layers to GPU.
-        # HuggingFace may reset attention implementation during .to(device).
-        # We save the config's _attn_implementation and restore it after deepcopy+move.
+        # === Create per-GPU contexts ===
         self._model_config = hf_model.config
-        logger.info("Creating GPU layer templates (per structure group, double buffered)...")
-        self.gpu_layer_templates = {}  # {group_id: [template_0, template_1]}
-        for gid, group in self.layer_groups.items():
-            representative_idx = group['indices'][0]
-            templates = []
-            for _ in range(2):
-                template = copy.deepcopy(self.cpu_layers[representative_idx])
-                # Preserve attention implementation before moving to GPU
-                _preserve_attn_implementation(template, self._model_config)
-                template = template.to(self.device)
-                # Ensure no autograd graph is attached to template parameters
-                for p in template.parameters():
-                    p.requires_grad_(False)
-                templates.append(template)
-            self.gpu_layer_templates[gid] = templates
+        self.gpu_contexts = []
 
-        # GPU modules (created once, reused)
-        logger.info("Creating GPU modules (once)...")
-        self.emb_gpu = copy.deepcopy(self.embedding).to(self.device)
-        self.norm_gpu = copy.deepcopy(self.norm).to(self.device) if self.norm else None
-        self.lm_head_gpu = copy.deepcopy(self.lm_head).to(self.device)
-
-        # Restore weight tying on GPU if detected
-        if self.tied_lm_head and hasattr(self.lm_head_gpu, "weight"):
-            self.lm_head_gpu.weight = self.emb_gpu.weight
-            logger.info("Restored weight tying on GPU (lm_head.weight -> embedding.weight)")
-
-        self.rotary_gpu = copy.deepcopy(self.rotary_emb).to(self.device) if self.rotary_emb else None
-
-        # === CUDA streams ===
-        self.compute_stream = torch.cuda.current_stream(device=self.device)
-        self.weight_stream = torch.cuda.Stream(device=self.device)
-        self.grad_stream = torch.cuda.Stream(device=self.device)
-
-        # === Synchronization events ===
-        self.weight_ready_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        self.h2d_done_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        self.backward_done_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        self.buffer_busy_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        self.buffer_free_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        # Template protection: template can't be reused until grad D2H finishes
-        self.template_free_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(2)
-        ]
-        self.param_sync_event = torch.cuda.Event(enable_timing=False)
-        self.loss_backward_done = torch.cuda.Event(enable_timing=False)
-        self.embedding_backward_done = torch.cuda.Event(enable_timing=False)
-
-        # === K-slab gradient pool (sized for max layer) ===
-        logger.info(f"Creating categorized gradient slab pools...")
-
-        self.layer_grad_slabs = [
-            torch.empty(self.max_layer_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-            for _ in range(config.num_grad_slabs)
-        ]
-        self.layer_slab_events = [
-            torch.cuda.Event(enable_timing=False) for _ in range(config.num_grad_slabs)
-        ]
-        self.layer_slab_free_list = queue.Queue()
-        for i in range(config.num_grad_slabs):
-            self.layer_slab_free_list.put(i)
-
-        # Head slab
-        self.head_grad_slab = torch.empty(self.head_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-        self.head_slab_event = torch.cuda.Event(enable_timing=False)
-        self.head_slab_free = threading.Event()
-        self.head_slab_free.set()
-
-        # Embedding slab
-        self.embed_grad_slab = torch.empty(self.embed_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
-        self.embed_slab_event = torch.cuda.Event(enable_timing=False)
-        self.embed_slab_free = threading.Event()
-        self.embed_slab_free.set()
-
-        # CPU worker thread for async gradient accumulation
+        # CPU worker thread for async gradient accumulation (shared across all GPUs)
         self.grad_task_queue = queue.Queue()
         self.worker_stop = threading.Event()
         self.worker_thread = threading.Thread(target=self._grad_worker, daemon=True)
         self.worker_thread.start()
 
-        # Initialize events
-        logger.info("Initializing buffer state events...")
-        current_stream = torch.cuda.current_stream(self.device)
-        for i in range(2):
-            self.buffer_free_events[i].record(current_stream)
-            self.template_free_events[i].record(current_stream)
-            self.h2d_done_events[i].record(current_stream)
-        self.param_sync_event.record(current_stream)
-        current_stream.synchronize()
+        for gpu_idx, device_id in enumerate(config.devices):
+            ctx = self._create_gpu_context(gpu_idx, device_id)
+            self.gpu_contexts.append(ctx)
+
+        # Backward compat: expose first GPU's device for external code
+        self.device = self.gpu_contexts[0].device
 
         logger.info(f"Model: {len(self.cpu_layers)} layers, checkpoint every {config.checkpoint_interval}")
+        logger.info(f"GPUs: {len(self.gpu_contexts)} ({[str(ctx.device) for ctx in self.gpu_contexts]})")
         logger.info(f"Max flattened param size per layer: {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
         logger.info(f"Layer groups: {len(self.layer_groups)}")
-        logger.info(f"Gradient slab pools:")
+        logger.info(f"Gradient slab pools (per GPU):")
         logger.info(f"  - Layer slabs: {config.num_grad_slabs} x {self.max_layer_numel * config.dtype.itemsize / 1024**2:.2f} MB")
         logger.info(f"  - Head slab: 1 x {self.head_total_numel * config.dtype.itemsize / 1024**2:.2f} MB")
         logger.info(f"  - Embed slab: 1 x {self.embed_total_numel * config.dtype.itemsize / 1024**2:.2f} MB")
 
+    def _create_gpu_context(self, gpu_idx, device_id):
+        """Create a _GPUContext with all per-GPU resources for one device."""
+        config = self.config
+        device = torch.device(f"cuda:{device_id}")
+        ctx = _GPUContext(gpu_idx, device)
+
+        logger.info(f"Creating GPU context {gpu_idx} on {device}...")
+
+        # Double-buffered CPU flat buffers (pinned)
+        ctx.cpu_flat_buffers = [
+            torch.empty(self.max_layer_numel, dtype=config.dtype).pin_memory(),
+            torch.empty(self.max_layer_numel, dtype=config.dtype).pin_memory()
+        ]
+
+        # Double-buffered GPU flat params
+        ctx.gpu_flat_buffers = [
+            torch.empty(self.max_layer_numel, dtype=config.dtype, device=device),
+            torch.empty(self.max_layer_numel, dtype=config.dtype, device=device)
+        ]
+
+        # GPU layer templates (per structure group, double buffered)
+        ctx.gpu_layer_templates = {}
+        for gid, group in self.layer_groups.items():
+            representative_idx = group['indices'][0]
+            templates = []
+            for _ in range(2):
+                template = copy.deepcopy(self.cpu_layers[representative_idx])
+                _preserve_attn_implementation(template, self._model_config)
+                template = template.to(device)
+                for p in template.parameters():
+                    p.requires_grad_(False)
+                templates.append(template)
+            ctx.gpu_layer_templates[gid] = templates
+
+        # GPU modules
+        ctx.emb_gpu = copy.deepcopy(self.embedding).to(device)
+        ctx.norm_gpu = copy.deepcopy(self.norm).to(device) if self.norm else None
+        ctx.lm_head_gpu = copy.deepcopy(self.lm_head).to(device)
+
+        if self.tied_lm_head and hasattr(ctx.lm_head_gpu, "weight"):
+            ctx.lm_head_gpu.weight = ctx.emb_gpu.weight
+            logger.info(f"  GPU {gpu_idx}: Restored weight tying")
+
+        ctx.rotary_gpu = copy.deepcopy(self.rotary_emb).to(device) if self.rotary_emb else None
+
+        # CUDA streams
+        ctx.compute_stream = torch.cuda.current_stream(device=device)
+        ctx.weight_stream = torch.cuda.Stream(device=device)
+        ctx.grad_stream = torch.cuda.Stream(device=device)
+
+        # Synchronization events
+        ctx.weight_ready_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.h2d_done_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.backward_done_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.buffer_busy_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.buffer_free_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.template_free_events = [torch.cuda.Event(enable_timing=False) for _ in range(2)]
+        ctx.param_sync_event = torch.cuda.Event(enable_timing=False)
+        ctx.loss_backward_done = torch.cuda.Event(enable_timing=False)
+        ctx.embedding_backward_done = torch.cuda.Event(enable_timing=False)
+
+        # K-slab gradient pool
+        ctx.layer_grad_slabs = [
+            torch.empty(self.max_layer_numel, dtype=config.dtype, device='cpu', pin_memory=True)
+            for _ in range(config.num_grad_slabs)
+        ]
+        ctx.layer_slab_events = [
+            torch.cuda.Event(enable_timing=False) for _ in range(config.num_grad_slabs)
+        ]
+        ctx.layer_slab_free_list = queue.Queue()
+        for i in range(config.num_grad_slabs):
+            ctx.layer_slab_free_list.put(i)
+
+        # Head slab
+        ctx.head_grad_slab = torch.empty(self.head_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
+        ctx.head_slab_event = torch.cuda.Event(enable_timing=False)
+        ctx.head_slab_free = threading.Event()
+        ctx.head_slab_free.set()
+
+        # Embedding slab
+        ctx.embed_grad_slab = torch.empty(self.embed_total_numel, dtype=config.dtype, device='cpu', pin_memory=True)
+        ctx.embed_slab_event = torch.cuda.Event(enable_timing=False)
+        ctx.embed_slab_free = threading.Event()
+        ctx.embed_slab_free.set()
+
         # Flash-attn CrossEntropyLoss
         if FLASH_CE_AVAILABLE:
-            self.ce_loss = FlashCrossEntropyLoss(inplace_backward=True, ignore_index=-100, reduction='none')
-            logger.info("Using flash-attn CrossEntropyLoss (5-10x less memory)")
+            ctx.ce_loss = FlashCrossEntropyLoss(inplace_backward=True, ignore_index=-100, reduction='none')
         else:
-            self.ce_loss = None
-            logger.info("Flash-attn CE not available, using standard PyTorch CE")
+            ctx.ce_loss = None
 
-    def _get_gpu_layer(self, layer_idx, buffer_idx):
+        # Initialize events
+        current_stream = torch.cuda.current_stream(device)
+        for i in range(2):
+            ctx.buffer_free_events[i].record(current_stream)
+            ctx.template_free_events[i].record(current_stream)
+            ctx.h2d_done_events[i].record(current_stream)
+        ctx.param_sync_event.record(current_stream)
+        current_stream.synchronize()
+
+        return ctx
+
+    def _get_gpu_layer(self, layer_idx, buffer_idx, ctx):
         """Get the GPU layer template for a given layer index and buffer slot."""
         group_id = self.layer_to_group[layer_idx]
-        return self.gpu_layer_templates[group_id][buffer_idx]
+        return ctx.gpu_layer_templates[group_id][buffer_idx]
 
     def _grad_worker(self):
-        """CPU worker thread: wait for D2H completion, accumulate gradients, return slab to pool."""
+        """CPU worker thread: wait for D2H completion, accumulate gradients, return slab to pool.
+
+        Receives tasks from all GPUs via the shared grad_task_queue. Each task
+        includes a ctx reference so the worker uses the correct GPU's slabs/events.
+        """
         while not self.worker_stop.is_set():
             try:
                 task = self.grad_task_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            slab_type, slab_idx, cpu_params, shapes, numels = task
+            slab_type, slab_idx, cpu_params, shapes, numels, ctx = task
 
             if slab_type == 'layer':
-                event = self.layer_slab_events[slab_idx]
-                slab_flat = self.layer_grad_slabs[slab_idx]
+                event = ctx.layer_slab_events[slab_idx]
+                slab_flat = ctx.layer_grad_slabs[slab_idx]
             elif slab_type == 'head':
-                event = self.head_slab_event
-                slab_flat = self.head_grad_slab
+                event = ctx.head_slab_event
+                slab_flat = ctx.head_grad_slab
             else:  # 'embed'
-                event = self.embed_slab_event
-                slab_flat = self.embed_grad_slab
+                event = ctx.embed_slab_event
+                slab_flat = ctx.embed_grad_slab
 
             event.synchronize()
 
@@ -593,39 +631,40 @@ class CPUMasterModel:
                 offset += numel
 
             if slab_type == 'layer':
-                self.layer_slab_free_list.put(slab_idx)
+                ctx.layer_slab_free_list.put(slab_idx)
             elif slab_type == 'head':
-                self.head_slab_free.set()
+                ctx.head_slab_free.set()
             else:
-                self.embed_slab_free.set()
+                ctx.embed_slab_free.set()
 
             self.grad_task_queue.task_done()
 
     def _sync_params_to_gpu(self):
-        """Sync CPU master params to GPU modules (call after optimizer step)."""
-        for p_gpu, p_cpu in zip(self.emb_gpu.parameters(), self.embedding.parameters()):
-            p_gpu.data.copy_(p_cpu.data, non_blocking=True)
-
-        if self.norm_gpu:
-            for p_gpu, p_cpu in zip(self.norm_gpu.parameters(), self.norm.parameters()):
+        """Sync CPU master params to all GPU modules (call after optimizer step)."""
+        for ctx in self.gpu_contexts:
+            for p_gpu, p_cpu in zip(ctx.emb_gpu.parameters(), self.embedding.parameters()):
                 p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-        if not self.tied_lm_head:
-            for p_gpu, p_cpu in zip(self.lm_head_gpu.parameters(), self.lm_head.parameters()):
-                p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+            if ctx.norm_gpu:
+                for p_gpu, p_cpu in zip(ctx.norm_gpu.parameters(), self.norm.parameters()):
+                    p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-        if self.rotary_gpu:
-            for p_gpu, p_cpu in zip(self.rotary_gpu.parameters(), self.rotary_emb.parameters()):
-                p_gpu.data.copy_(p_cpu.data, non_blocking=True)
+            if not self.tied_lm_head:
+                for p_gpu, p_cpu in zip(ctx.lm_head_gpu.parameters(), self.lm_head.parameters()):
+                    p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-        self.param_sync_event.record(torch.cuda.current_stream(self.device))
+            if ctx.rotary_gpu:
+                for p_gpu, p_cpu in zip(ctx.rotary_gpu.parameters(), self.rotary_emb.parameters()):
+                    p_gpu.data.copy_(p_cpu.data, non_blocking=True)
 
-    def _load_layer_to_buffer_async(self, layer_idx, buffer_idx):
+            ctx.param_sync_event.record(torch.cuda.current_stream(ctx.device))
+
+    def _load_layer_to_buffer_async(self, layer_idx, buffer_idx, ctx):
         """Load CPU layer params to GPU buffer asynchronously."""
-        self.h2d_done_events[buffer_idx].synchronize()
-        self.weight_stream.wait_event(self.buffer_free_events[buffer_idx])
+        ctx.h2d_done_events[buffer_idx].synchronize()
+        ctx.weight_stream.wait_event(ctx.buffer_free_events[buffer_idx])
 
-        cpu_flat = self.cpu_flat_buffers[buffer_idx]
+        cpu_flat = ctx.cpu_flat_buffers[buffer_idx]
         layer = self.cpu_layers[layer_idx]
         layer_numel = self.layer_numels[layer_idx]
 
@@ -635,25 +674,24 @@ class CPUMasterModel:
             cpu_flat[offset:offset + numel].copy_(p.data.flatten())
             offset += numel
 
-        with torch.cuda.stream(self.weight_stream):
-            # Only copy the actual layer size, not the full max buffer
-            self.gpu_flat_buffers[buffer_idx][:layer_numel].copy_(
+        with torch.cuda.stream(ctx.weight_stream):
+            ctx.gpu_flat_buffers[buffer_idx][:layer_numel].copy_(
                 cpu_flat[:layer_numel], non_blocking=True
             )
-            self.weight_ready_events[buffer_idx].record(self.weight_stream)
-            self.h2d_done_events[buffer_idx].record(self.weight_stream)
+            ctx.weight_ready_events[buffer_idx].record(ctx.weight_stream)
+            ctx.h2d_done_events[buffer_idx].record(ctx.weight_stream)
 
-    def _unflatten_to_layer(self, layer_idx, buffer_idx):
+    def _unflatten_to_layer(self, layer_idx, buffer_idx, ctx):
         """Unflatten GPU buffer to the appropriate layer template parameters.
 
         After unflatten, the flat buffer is FREE (data copied to template).
         Template is protected by template_free_events until grad D2H completes.
         """
-        flat = self.gpu_flat_buffers[buffer_idx]
-        gpu_layer = self._get_gpu_layer(layer_idx, buffer_idx)
+        flat = ctx.gpu_flat_buffers[buffer_idx]
+        gpu_layer = self._get_gpu_layer(layer_idx, buffer_idx, ctx)
 
         # Wait for template to be free (grad D2H from previous use must complete)
-        self.compute_stream.wait_event(self.template_free_events[buffer_idx])
+        ctx.compute_stream.wait_event(ctx.template_free_events[buffer_idx])
 
         offset = 0
         for p in gpu_layer.parameters():
@@ -662,10 +700,45 @@ class CPUMasterModel:
             offset += numel
 
         # Flat buffer is now free — template holds its own copy
-        self.buffer_free_events[buffer_idx].record(self.compute_stream)
+        ctx.buffer_free_events[buffer_idx].record(ctx.compute_stream)
+
+    @staticmethod
+    def _prepare_4d_causal_mask(mask_2d, dtype, T):
+        """Convert 2D padding mask [B, T] to 4D causal attention mask [B, 1, T, T].
+
+        HF models normally do this inside their top-level forward(). Since MegaTrain
+        calls decoder layers directly, we replicate the logic here.
+
+        Returns None if all tokens are unmasked (lets attention use efficient causal mode).
+        """
+        device = mask_2d.device
+
+        # If no padding, return None (attention will use is_causal=True fast path)
+        if mask_2d.all():
+            return None
+
+        # Causal mask: lower triangular
+        causal = torch.triu(
+            torch.full((T, T), torch.finfo(dtype).min, device=device, dtype=dtype),
+            diagonal=1,
+        )
+        # Expand: [1, 1, T, T]
+        causal = causal.unsqueeze(0).unsqueeze(0)
+
+        # Padding mask: [B, 1, 1, T] — positions with 0 get large negative value
+        padding = mask_2d[:, None, None, :].to(dtype)  # 1.0 for attend, 0.0 for pad
+        padding = (1.0 - padding) * torch.finfo(dtype).min
+
+        # Combine: [B, 1, T, T]
+        return causal + padding
 
     def _build_layer_kwargs(self, mask, cache_position, position_ids, position_embeddings):
         """Build kwargs dict for layer forward, based on what the layer accepts."""
+        # Flash attention handles 2D masks internally; SDPA/eager need 4D causal masks.
+        # If mask is already 4D (pre-computed in multi-GPU orchestrator), pass as-is.
+        if mask is not None and mask.dim() == 2 and self.config.attn_implementation != 'flash_attention_2':
+            T = mask.shape[1]
+            mask = self._prepare_4d_causal_mask(mask, self.config.dtype, T)
         kwargs = {
             'attention_mask': mask,
             'use_cache': False,
@@ -679,42 +752,43 @@ class CPUMasterModel:
             kwargs['position_ids'] = position_ids
         return kwargs
 
-    def _collect_layer_grads_async(self, layer_idx, buffer_idx):
+    def _collect_layer_grads_async(self, layer_idx, buffer_idx, ctx):
         """Collect GPU buffer grads to CPU layer using K-slab flat buffer pool."""
-        slab_idx = self.layer_slab_free_list.get()
-        slab_flat = self.layer_grad_slabs[slab_idx]
+        slab_idx = ctx.layer_slab_free_list.get()
+        slab_flat = ctx.layer_grad_slabs[slab_idx]
 
-        self.grad_stream.wait_event(self.backward_done_events[buffer_idx])
+        ctx.grad_stream.wait_event(ctx.backward_done_events[buffer_idx])
 
-        gpu_layer = self._get_gpu_layer(layer_idx, buffer_idx)
+        gpu_layer = self._get_gpu_layer(layer_idx, buffer_idx, ctx)
 
-        with torch.cuda.stream(self.grad_stream):
+        with torch.cuda.stream(ctx.grad_stream):
             offset = 0
             for p_gpu in gpu_layer.parameters():
                 if p_gpu.grad is not None:
                     numel = p_gpu.grad.numel()
                     slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
-                    p_gpu.grad.record_stream(self.grad_stream)
+                    p_gpu.grad.record_stream(ctx.grad_stream)
                     p_gpu.grad = None
                     offset += numel
 
-            self.layer_slab_events[slab_idx].record(self.grad_stream)
+            ctx.layer_slab_events[slab_idx].record(ctx.grad_stream)
             # Template is free after grad D2H (NOT buffer_free — flat buffer freed at unflatten)
-            self.template_free_events[buffer_idx].record(self.grad_stream)
+            ctx.template_free_events[buffer_idx].record(ctx.grad_stream)
 
         self.grad_task_queue.put((
             'layer',
             slab_idx,
             self.layer_cpu_params[layer_idx],
             self.layer_param_shapes[layer_idx],
-            self.layer_param_numel[layer_idx]
+            self.layer_param_numel[layer_idx],
+            ctx,
         ))
 
     def _accumulate_grads_batch(self):
         """Wait for CPU worker to finish all gradient accumulation tasks."""
         self.grad_task_queue.join()
 
-    def _process_vision(self, pixel_values, **vision_kwargs):
+    def _process_vision(self, pixel_values, ctx, **vision_kwargs):
         """Process images through vision encoder + projector on GPU, then offload.
 
         Both vision encoder and projector are loaded to GPU on-demand and
@@ -722,6 +796,7 @@ class CPUMasterModel:
 
         Args:
             pixel_values: Image tensor from processor
+            ctx: _GPUContext for the target device
             **vision_kwargs: Additional kwargs (image_grid_thw, etc.)
 
         Returns:
@@ -731,19 +806,15 @@ class CPUMasterModel:
             return None
 
         # 1. Load vision encoder to GPU, process images
-        self.vision_encoder.to(self.device)
+        self.vision_encoder.to(ctx.device)
         with torch.no_grad():
-            pv = pixel_values.to(self.device)
-            # Most vision encoders accept pixel_values directly
-            # Some (Qwen-VL) also need grid_thw
-            vkw = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+            pv = pixel_values.to(ctx.device)
+            vkw = {k: v.to(ctx.device) if isinstance(v, torch.Tensor) else v
                    for k, v in vision_kwargs.items()}
             try:
                 image_features = self.vision_encoder(pv, **vkw)
             except TypeError:
-                # Fallback: some encoders don't accept extra kwargs
                 image_features = self.vision_encoder(pv)
-            # Handle tuple output (some encoders return (hidden_states, ...))
             if isinstance(image_features, tuple):
                 image_features = image_features[0]
         self.vision_encoder.cpu()
@@ -752,7 +823,7 @@ class CPUMasterModel:
 
         # 2. Load projector to GPU, project features
         if self.projector is not None:
-            self.projector.to(self.device)
+            self.projector.to(ctx.device)
             with torch.no_grad():
                 image_embeds = self.projector(image_features)
             self.projector.cpu()
@@ -820,68 +891,71 @@ class CPUMasterModel:
 
         return merged
 
-    def forward_and_backward(self, input_ids, attention_mask, labels,
-                              pixel_values=None, **vision_kwargs):
+    def _forward_and_backward_single_gpu(self, ctx, input_ids, attention_mask, labels,
+                                          pixel_values=None, global_valid_tokens=None, **vision_kwargs):
+        """Run forward + backward on a single GPU context.
+
+        Args:
+            global_valid_tokens: If provided, divide loss by this count instead of
+                the local valid token count. Used in multi-GPU mode so all GPUs
+                normalize by the same global count, ensuring the 1/N scaling happens
+                in float32 inside autograd (matching single-GPU precision exactly).
+
+        Returns (loss_val, total_tokens, timing_dict, valid_tokens). Does NOT call
+        _accumulate_grads_batch — the orchestrator handles that.
+        """
         B, T = input_ids.shape
 
-        self.compute_stream.wait_event(self.param_sync_event)
+        ctx.compute_stream.wait_event(ctx.param_sync_event)
 
         start = torch.cuda.Event(enable_timing=True)
         fwd_end = torch.cuda.Event(enable_timing=True)
         bwd_end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        start.record(ctx.compute_stream)
 
         # === FORWARD ===
 
-        # === VLM: Process images first (vision encoder + projector on GPU, then offload) ===
+        # VLM: Process images first
         image_embeds = None
         if self.is_vlm and pixel_values is not None:
-            image_embeds = self._process_vision(pixel_values, **vision_kwargs)
+            image_embeds = self._process_vision(pixel_values, ctx, **vision_kwargs)
 
-        input_ids_gpu = input_ids.to(self.device)
-        hidden = self.emb_gpu(input_ids_gpu)
+        input_ids_gpu = input_ids.to(ctx.device)
+        hidden = ctx.emb_gpu(input_ids_gpu)
 
-        # Merge image embeddings into hidden states at image token positions
         if image_embeds is not None:
             hidden = self._merge_vision_embeddings(hidden, image_embeds, input_ids_gpu)
             del image_embeds
 
         del input_ids_gpu
 
-        # Position info (model-agnostic)
-        cache_position = torch.arange(T, device=self.device)
-        position_ids = torch.arange(T, device=self.device).unsqueeze(0).expand(B, -1)
+        # Position info
+        cache_position = torch.arange(T, device=ctx.device)
+        position_ids = torch.arange(T, device=ctx.device).unsqueeze(0).expand(B, -1)
 
-        # Compute position_embeddings if model has model-level rotary_emb
         position_embeddings = None
-        if self.rotary_gpu and self.layer_accepts_position_embeddings:
+        if ctx.rotary_gpu and self.layer_accepts_position_embeddings:
             if self.is_vlm:
-                # VLM models (e.g., Qwen2.5-VL) use M-RoPE with 3D position_ids [3, B, T]
-                # For text-only input, use simple sequential positions for all 3 dims
-                pos_3d = torch.arange(T, device=self.device).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
-                dummy = torch.empty((1, 1, T, self.head_dim), device=self.device, dtype=torch.float32)
-                cos, sin = self.rotary_gpu(dummy, pos_3d)
+                pos_3d = torch.arange(T, device=ctx.device).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
+                dummy = torch.empty((1, 1, T, self.head_dim), device=ctx.device, dtype=torch.float32)
+                cos, sin = ctx.rotary_gpu(dummy, pos_3d)
                 position_embeddings = (cos.to(self.config.dtype), sin.to(self.config.dtype))
                 del dummy, pos_3d
             else:
-                dummy = torch.empty((1, 1, T, self.head_dim), device=self.device, dtype=torch.float32)
-                cos, sin = self.rotary_gpu(dummy, position_ids[:1])
+                dummy = torch.empty((1, 1, T, self.head_dim), device=ctx.device, dtype=torch.float32)
+                cos, sin = ctx.rotary_gpu(dummy, position_ids[:1])
                 position_embeddings = (cos.to(self.config.dtype), sin.to(self.config.dtype))
                 del dummy
 
-        # Attention mask: pass as-is (2D), let HF layers handle 4D expansion
-        mask = attention_mask.to(self.device)
-
-        # Build layer kwargs once
+        mask = attention_mask.to(ctx.device)
         layer_kwargs = self._build_layer_kwargs(mask, cache_position, position_ids, position_embeddings)
 
-        # Checkpoints
         checkpoints = {}
 
         with torch.no_grad():
-            self._load_layer_to_buffer_async(0, 0)
-            self.weight_stream.synchronize()
-            self._unflatten_to_layer(0, 0)
+            self._load_layer_to_buffer_async(0, 0, ctx)
+            ctx.weight_stream.synchronize()
+            self._unflatten_to_layer(0, 0, ctx)
 
             for i in range(len(self.cpu_layers)):
                 buffer_idx = i % 2
@@ -891,50 +965,49 @@ class CPUMasterModel:
                     checkpoints[i] = hidden.detach()
 
                 if i + 1 < len(self.cpu_layers):
-                    self._load_layer_to_buffer_async(i + 1, next_buffer_idx)
+                    self._load_layer_to_buffer_async(i + 1, next_buffer_idx, ctx)
 
-                self.compute_stream.wait_event(self.weight_ready_events[buffer_idx])
+                ctx.compute_stream.wait_event(ctx.weight_ready_events[buffer_idx])
 
-                with torch.cuda.stream(self.compute_stream):
-                    self._unflatten_to_layer(i, buffer_idx)
-                    self.buffer_busy_events[buffer_idx].record(self.compute_stream)
+                with torch.cuda.stream(ctx.compute_stream):
+                    self._unflatten_to_layer(i, buffer_idx, ctx)
+                    ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
-                    gpu_layer = self._get_gpu_layer(i, buffer_idx)
+                    gpu_layer = self._get_gpu_layer(i, buffer_idx, ctx)
                     out = gpu_layer(hidden, **layer_kwargs)
                     hidden = out[0] if isinstance(out, tuple) else out
 
         checkpoints[len(self.cpu_layers)] = hidden.detach()
 
-        if self.norm_gpu:
-            hidden = self.norm_gpu(hidden)
+        if ctx.norm_gpu:
+            hidden = ctx.norm_gpu(hidden)
 
-        fwd_end.record()
+        fwd_end.record(ctx.compute_stream)
 
         # === LOSS + BACKWARD ===
-        labels_gpu = labels.to(self.device)
-        H = self.hidden_size
+        labels_gpu = labels.to(ctx.device)
         V = self.vocab_size
         chunk_size = 128
 
         hidden_before_norm = checkpoints[len(self.cpu_layers)].requires_grad_(True)
-        if self.norm_gpu:
-            hidden_after_norm = self.norm_gpu(hidden_before_norm)
+        if ctx.norm_gpu:
+            hidden_after_norm = ctx.norm_gpu(hidden_before_norm)
         else:
             hidden_after_norm = hidden_before_norm
 
-        total_loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        total_loss = torch.zeros((), device=ctx.device, dtype=torch.float32)
         total_valid_tokens = 0
 
         for t_start in range(0, T - 1, chunk_size):
             t_end = min(t_start + chunk_size, T - 1)
             h = hidden_after_norm[:, t_start:t_end, :]
             y = labels_gpu[:, t_start+1:t_end+1]
-            logits = self.lm_head_gpu(h)
+            logits = ctx.lm_head_gpu(h)
             flat_y = y.reshape(-1)
             flat_logits = logits.reshape(-1, V)
 
-            if self.ce_loss is not None:
-                per_tok = self.ce_loss(flat_logits, flat_y)
+            if ctx.ce_loss is not None:
+                per_tok = ctx.ce_loss(flat_logits, flat_y)
                 valid = (flat_y != -100)
                 loss_chunk = per_tok[valid].sum()
                 total_valid_tokens += int(valid.sum().item())
@@ -949,52 +1022,54 @@ class CPUMasterModel:
 
         if total_valid_tokens == 0:
             logger.warning("No valid tokens in batch! Skipping...")
-            return 0.0, B * T, {'forward': 0.0, 'backward': 0.0}
+            return 0.0, B * T, {'forward': 0.0, 'backward': 0.0}, 0
 
-        loss = total_loss / total_valid_tokens
-        loss_val = loss.item()
+        # Normalize by global token count if provided (multi-GPU), else local count
+        denom = global_valid_tokens if global_valid_tokens is not None else total_valid_tokens
+        loss = total_loss / denom
+        loss_val = (total_loss / total_valid_tokens).item()  # always report per-token mean
 
         if not torch.isfinite(torch.tensor(loss_val)):
             logger.error(f"Loss is {loss_val}! Training may be unstable.")
 
         loss.backward()
-        self.loss_backward_done.record(self.compute_stream)
+        ctx.loss_backward_done.record(ctx.compute_stream)
 
         grad_hidden = hidden_before_norm.grad.detach()
 
         # Collect lm_head/norm grads
-        if not self.head_slab_free.wait(timeout=30.0):
+        if not ctx.head_slab_free.wait(timeout=30.0):
             raise RuntimeError("head slab wait timeout: worker may be stalled")
-        self.head_slab_free.clear()
-        slab_flat = self.head_grad_slab
+        ctx.head_slab_free.clear()
+        slab_flat = ctx.head_grad_slab
 
-        with torch.cuda.stream(self.grad_stream):
-            self.grad_stream.wait_event(self.loss_backward_done)
+        with torch.cuda.stream(ctx.grad_stream):
+            ctx.grad_stream.wait_event(ctx.loss_backward_done)
             offset = 0
             if not self.tied_lm_head:
-                for p_gpu in self.lm_head_gpu.parameters():
+                for p_gpu in ctx.lm_head_gpu.parameters():
                     if p_gpu.grad is not None:
                         numel = p_gpu.grad.numel()
                         slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
                         p_gpu.grad = None
                         offset += numel
-            if self.norm_gpu:
-                for p_gpu in self.norm_gpu.parameters():
+            if ctx.norm_gpu:
+                for p_gpu in ctx.norm_gpu.parameters():
                     if p_gpu.grad is not None:
                         numel = p_gpu.grad.numel()
                         slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
                         p_gpu.grad = None
                         offset += numel
-            self.head_slab_event.record(self.grad_stream)
+            ctx.head_slab_event.record(ctx.grad_stream)
 
         cpu_params = []
         if not self.tied_lm_head:
             cpu_params.extend(self.lm_head.parameters())
-        if self.norm_gpu:
+        if self.norm:
             cpu_params.extend(self.norm.parameters())
         shapes = [p.shape for p in cpu_params]
         numels = [p.numel() for p in cpu_params]
-        self.grad_task_queue.put(('head', None, cpu_params, shapes, numels))
+        self.grad_task_queue.put(('head', None, cpu_params, shapes, numels, ctx))
 
         del labels_gpu, hidden_after_norm, hidden_before_norm, total_loss
 
@@ -1007,28 +1082,26 @@ class CPUMasterModel:
 
             current_checkpoint = checkpoints[block_start]
 
-            # Recompute block
             recompute_cache = {}
             hidden_recompute = current_checkpoint
 
             with torch.no_grad():
                 for j in range(block_start, block_end):
                     buffer_idx = j % 2
-                    self._load_layer_to_buffer_async(j, buffer_idx)
-                    self.compute_stream.wait_event(self.weight_ready_events[buffer_idx])
+                    self._load_layer_to_buffer_async(j, buffer_idx, ctx)
+                    ctx.compute_stream.wait_event(ctx.weight_ready_events[buffer_idx])
 
-                    with torch.cuda.stream(self.compute_stream):
-                        self._unflatten_to_layer(j, buffer_idx)
-                        self.buffer_busy_events[buffer_idx].record(self.compute_stream)
+                    with torch.cuda.stream(ctx.compute_stream):
+                        self._unflatten_to_layer(j, buffer_idx, ctx)
+                        ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
-                        gpu_layer = self._get_gpu_layer(j, buffer_idx)
+                        gpu_layer = self._get_gpu_layer(j, buffer_idx, ctx)
                         out = gpu_layer(hidden_recompute, **layer_kwargs)
                         hidden_recompute = out[0] if isinstance(out, tuple) else out
 
                     recompute_cache[j] = hidden_recompute.detach()
                     del out
 
-            # Backward through block
             for i in range(block_end - 1, block_start - 1, -1):
                 buffer_idx = i % 2
 
@@ -1037,16 +1110,15 @@ class CPUMasterModel:
                 else:
                     layer_input = recompute_cache[i - 1].requires_grad_(True)
 
-                self._load_layer_to_buffer_async(i, buffer_idx)
-                self.compute_stream.wait_event(self.weight_ready_events[buffer_idx])
+                self._load_layer_to_buffer_async(i, buffer_idx, ctx)
+                ctx.compute_stream.wait_event(ctx.weight_ready_events[buffer_idx])
 
-                with torch.cuda.stream(self.compute_stream):
-                    self._unflatten_to_layer(i, buffer_idx)
-                    self.buffer_busy_events[buffer_idx].record(self.compute_stream)
+                with torch.cuda.stream(ctx.compute_stream):
+                    self._unflatten_to_layer(i, buffer_idx, ctx)
+                    ctx.buffer_busy_events[buffer_idx].record(ctx.compute_stream)
 
-                    gpu_layer = self._get_gpu_layer(i, buffer_idx)
+                    gpu_layer = self._get_gpu_layer(i, buffer_idx, ctx)
 
-                    # Temporarily enable gradients on GPU template parameters for autograd.grad
                     for p in gpu_layer.parameters():
                         p.requires_grad_(True)
 
@@ -1067,13 +1139,12 @@ class CPUMasterModel:
                     for p, g in zip(gpu_layer.parameters(), param_grads):
                         p.grad = g
 
-                    # Disable gradients again to keep templates clean
                     for p in gpu_layer.parameters():
                         p.requires_grad_(False)
 
-                    self.backward_done_events[buffer_idx].record(self.compute_stream)
+                    ctx.backward_done_events[buffer_idx].record(ctx.compute_stream)
 
-                self._collect_layer_grads_async(i, buffer_idx)
+                self._collect_layer_grads_async(i, buffer_idx, ctx)
 
                 if i in recompute_cache:
                     del recompute_cache[i]
@@ -1082,44 +1153,42 @@ class CPUMasterModel:
             recompute_cache.clear()
 
         # === BACKWARD THROUGH EMBEDDING ===
-        input_ids_gpu = input_ids.to(self.device)
-        emb_out = self.emb_gpu(input_ids_gpu)
+        input_ids_gpu = input_ids.to(ctx.device)
+        emb_out = ctx.emb_gpu(input_ids_gpu)
 
         assert emb_out.shape == grad_hidden.shape, \
             f"Shape mismatch: emb_out {emb_out.shape} vs grad_hidden {grad_hidden.shape}"
 
         emb_out.backward(grad_hidden)
-        self.embedding_backward_done.record(self.compute_stream)
+        ctx.embedding_backward_done.record(ctx.compute_stream)
 
-        if not self.embed_slab_free.wait(timeout=30.0):
+        if not ctx.embed_slab_free.wait(timeout=30.0):
             raise RuntimeError("embed slab wait timeout: worker may be stalled")
-        self.embed_slab_free.clear()
-        slab_flat = self.embed_grad_slab
+        ctx.embed_slab_free.clear()
+        slab_flat = ctx.embed_grad_slab
 
-        with torch.cuda.stream(self.grad_stream):
-            self.grad_stream.wait_event(self.embedding_backward_done)
+        with torch.cuda.stream(ctx.grad_stream):
+            ctx.grad_stream.wait_event(ctx.embedding_backward_done)
             offset = 0
-            for p_gpu in self.emb_gpu.parameters():
+            for p_gpu in ctx.emb_gpu.parameters():
                 if p_gpu.grad is not None:
                     numel = p_gpu.grad.numel()
                     slab_flat[offset:offset + numel].copy_(p_gpu.grad.flatten(), non_blocking=True)
                     p_gpu.grad = None
                     offset += numel
-            self.embed_slab_event.record(self.grad_stream)
+            ctx.embed_slab_event.record(ctx.grad_stream)
 
         cpu_params = list(self.embedding.parameters())
         shapes = [p.shape for p in cpu_params]
         numels = [p.numel() for p in cpu_params]
-        self.grad_task_queue.put(('embed', None, cpu_params, shapes, numels))
+        self.grad_task_queue.put(('embed', None, cpu_params, shapes, numels, ctx))
 
         del input_ids_gpu, emb_out
         del mask, cache_position, position_ids, position_embeddings, grad_hidden
         checkpoints.clear()
 
-        self._accumulate_grads_batch()
-
-        bwd_end.record()
-        torch.cuda.synchronize()
+        bwd_end.record(ctx.compute_stream)
+        torch.cuda.synchronize(ctx.device)
         fwd_time = start.elapsed_time(fwd_end) / 1000.0
         bwd_time = fwd_end.elapsed_time(bwd_end) / 1000.0
         total_time = start.elapsed_time(bwd_end) / 1000.0
@@ -1130,7 +1199,94 @@ class CPUMasterModel:
             'forward': fwd_time,
             'backward': bwd_time,
             'total': total_time,
-        }
+        }, total_valid_tokens
+
+    def forward_and_backward(self, input_ids, attention_mask, labels,
+                              pixel_values=None, **vision_kwargs):
+        """Run forward + backward across all GPUs with data parallelism.
+
+        Splits the batch across GPUs, runs forward/backward concurrently via
+        threading, accumulates gradients, and averages by world_size.
+        """
+        world_size = self.world_size
+
+        if world_size == 1:
+            # Fast path: no threading overhead
+            loss_val, total_tokens, timing, _ = self._forward_and_backward_single_gpu(
+                self.gpu_contexts[0], input_ids, attention_mask, labels,
+                pixel_values=pixel_values, **vision_kwargs)
+            self._accumulate_grads_batch()
+            return loss_val, total_tokens, timing
+
+        # Pre-compute global valid token count from labels (before splitting)
+        global_valid_tokens = int((labels != -100).sum().item())
+
+        # Split batch across GPUs
+        B = input_ids.shape[0]
+        per_gpu = B // world_size
+        id_chunks = input_ids.split(per_gpu)
+        mask_chunks = attention_mask.split(per_gpu)
+        label_chunks = labels.split(per_gpu)
+
+        # Split vision kwargs if present
+        vision_chunks = [{} for _ in range(world_size)]
+        if pixel_values is not None:
+            pv_chunks = pixel_values.split(per_gpu)
+            for i in range(world_size):
+                vision_chunks[i]['pixel_values'] = pv_chunks[i]
+            for k, v in vision_kwargs.items():
+                if isinstance(v, torch.Tensor) and v.shape[0] == B:
+                    v_chunks = v.split(per_gpu)
+                    for i in range(world_size):
+                        vision_chunks[i][k] = v_chunks[i]
+                else:
+                    for i in range(world_size):
+                        vision_chunks[i][k] = v
+
+        results = [None] * world_size
+        errors = [None] * world_size
+
+        def run_gpu(gpu_idx):
+            try:
+                pv = vision_chunks[gpu_idx].pop('pixel_values', None)
+                results[gpu_idx] = self._forward_and_backward_single_gpu(
+                    self.gpu_contexts[gpu_idx],
+                    id_chunks[gpu_idx], mask_chunks[gpu_idx], label_chunks[gpu_idx],
+                    pixel_values=pv, global_valid_tokens=global_valid_tokens,
+                    **vision_chunks[gpu_idx])
+            except Exception as e:
+                errors[gpu_idx] = e
+
+        threads = [threading.Thread(target=run_gpu, args=(i,)) for i in range(world_size)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for i, e in enumerate(errors):
+            if e is not None:
+                raise RuntimeError(f"GPU {i} failed: {e}") from e
+
+        # Wait for all gradient tasks from all GPUs
+        self._accumulate_grads_batch()
+
+        # No post-hoc gradient scaling needed. Each GPU backwards
+        # loss = local_sum_loss / global_valid_tokens, so the 1/N scaling
+        # happens in float32 inside autograd. The grad worker sums across GPUs:
+        # accumulated = sum_i(d(local_sum_i / N_global)/d(params))
+        #             = d(total_sum / N_global)/d(params)
+        # which is exactly what single-GPU computes.
+
+        # Aggregate loss (weighted by valid tokens per GPU)
+        total_valid = sum(r[3] for r in results)
+        total_loss_sum = sum(r[0] * r[3] for r in results)  # loss_val * valid_tokens
+        total_tokens = sum(r[1] for r in results)
+        avg_loss = total_loss_sum / total_valid if total_valid > 0 else 0.0
+
+        # Timing: take max across GPUs (wall-clock bound)
+        timing = {k: max(r[2].get(k, 0) for r in results) for k in results[0][2]}
+
+        return avg_loss, total_tokens, timing
 
     def get_parameters(self, include_vision=False):
         """Get all parameters, deduplicated by object id to avoid double-optimizing tied weights.
@@ -1188,3 +1344,9 @@ class CPUMasterModel:
         """Stop worker thread and cleanup resources."""
         self.worker_stop.set()
         self.worker_thread.join(timeout=5.0)
+        # Clear GPU contexts
+        for ctx in self.gpu_contexts:
+            del ctx.gpu_layer_templates
+            del ctx.gpu_flat_buffers, ctx.cpu_flat_buffers
+            del ctx.emb_gpu, ctx.norm_gpu, ctx.lm_head_gpu, ctx.rotary_gpu
+        self.gpu_contexts.clear()
