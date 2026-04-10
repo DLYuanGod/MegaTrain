@@ -1,0 +1,41 @@
+# GLM-4.6V-Flash (10.3B VLM) Configuration
+#
+# Batch size from calc_resource.py: GLM4-9B, 80GB H100, seq=512
+# Recommended: 265, using safe (80%): 212
+# VLM overhead reduces effective batch size further; using 128.
+
+model:
+  name: "zai-org/GLM-4.6V-Flash"
+  dtype: "bfloat16"
+  device: 0
+  attn_implementation: "flash_attention_2"
+  trust_remote_code: true
+
+dataset:
+  name: "vqav2_small"
+  dataset_dir: "data"
+  max_seq_len: 512
+  num_workers: 2
+
+training:
+  batch_size: 128
+  gradient_accumulation_steps: 1
+  num_steps: 3
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+
+optimizer:
+  type: "deepspeed_adam"
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+
+memory:
+  checkpoint_interval: 4
+  num_grad_slabs: 12
+
+logging:
+  log_interval: 1
+  enable_timing: true

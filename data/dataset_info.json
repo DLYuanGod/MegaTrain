@@ -83,6 +83,16 @@
       "assistant_tag": "gpt"
     }
   },
+  "vqav2_small": {
+    "hf_hub_url": "merve/vqav2-small",
+    "split": "validation",
+    "num_samples": 200,
+    "columns": {
+      "prompt": "question",
+      "response": "multiple_choice_answer",
+      "images": "image"
+    }
+  },
   "sharegpt4v": {
     "hf_hub_url": "Lin-Chen/ShareGPT4V",
     "formatting": "sharegpt",

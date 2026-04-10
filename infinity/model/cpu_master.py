@@ -85,8 +85,8 @@ def _discover_model_components(hf_model):
         'llama4':      ('language_model',         ['vision_model'],  'multi_modal_projector'),
         'gemma3':      ('language_model',         ['vision_tower'],  'multi_modal_projector'),
         'internvl':    ('language_model',         ['vision_tower'],  'multi_modal_projector'),
-        'glm4v':       ('language_model',         ['visual'],        'visual.merger'),
-        'glm4v_moe':   ('language_model',         ['visual'],        'visual.merger'),
+        'glm4v':       ('model.language_model',   ['model.visual'],  'model.visual.merger'),
+        'glm4v_moe':   ('model.language_model',   ['model.visual'],  'model.visual.merger'),
         'minicpmv':    ('llm',                    ['vpm'],           'resampler'),
         'minicpmo':    ('llm',                    ['vpm', 'apm'],    'resampler'),
         'mllama':      ('language_model',         ['vision_model'],  'multi_modal_projector'),
@@ -734,18 +734,43 @@ class CPUMasterModel:
         self.vision_encoder.to(self.device)
         with torch.no_grad():
             pv = pixel_values.to(self.device)
-            # Most vision encoders accept pixel_values directly
-            # Some (Qwen-VL) also need grid_thw
-            vkw = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                   for k, v in vision_kwargs.items()}
+            # Map processor output keys to vision encoder parameter names.
+            # HF processors output "image_grid_thw" but Qwen-VL vision encoders
+            # expect "grid_thw". Introspect the encoder's forward signature and
+            # strip the common "image_" prefix when the encoder doesn't accept
+            # the prefixed name but does accept the short name.
+            encoder_params = _introspect_layer_forward(self.vision_encoder)
+            vkw = {}
+            for k, v in vision_kwargs.items():
+                val = v.to(self.device) if isinstance(v, torch.Tensor) else v
+                if k in encoder_params:
+                    vkw[k] = val
+                elif k.startswith("image_") and k[len("image_"):] in encoder_params:
+                    vkw[k[len("image_"):]] = val
+                # else: skip keys the encoder doesn't accept
+            # grid_thw may have an extra batch dim from collation [B, N_img, 3];
+            # vision encoders expect [total_images, 3], so flatten if needed.
+            if 'grid_thw' in vkw and vkw['grid_thw'].dim() == 3:
+                vkw['grid_thw'] = vkw['grid_thw'].reshape(-1, 3)
             try:
                 image_features = self.vision_encoder(pv, **vkw)
             except TypeError:
                 # Fallback: some encoders don't accept extra kwargs
                 image_features = self.vision_encoder(pv)
-            # Handle tuple output (some encoders return (hidden_states, ...))
-            if isinstance(image_features, tuple):
-                image_features = image_features[0]
+            # Handle non-tensor output (ModelOutput, tuple, etc.)
+            if not isinstance(image_features, torch.Tensor):
+                if hasattr(image_features, 'last_hidden_state'):
+                    image_features = image_features.last_hidden_state
+                elif isinstance(image_features, (tuple, list)):
+                    image_features = image_features[0]
+                elif hasattr(image_features, 'hidden_states'):
+                    image_features = image_features.hidden_states
+                else:
+                    # Generic fallback: grab first tensor value
+                    image_features = next(
+                        v for v in (image_features.values() if hasattr(image_features, 'values') else [image_features])
+                        if isinstance(v, torch.Tensor)
+                    )
         self.vision_encoder.cpu()
         torch.cuda.empty_cache()
         logger.debug(f"Vision encoder done, features shape: {image_features.shape}")
@@ -780,9 +805,9 @@ class CPUMasterModel:
         # Find image token positions
         # Common image token IDs across models
         IMAGE_TOKEN_IDS = set()
-        # Try to get from model config
+        # Try to get from the HF model config (not the training config)
         for attr in ['image_token_id', 'vision_start_token_id']:
-            tid = getattr(self.config, attr, None)
+            tid = getattr(self._model_config, attr, None)
             if tid is not None:
                 IMAGE_TOKEN_IDS.add(tid)
 
