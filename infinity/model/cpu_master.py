@@ -555,6 +555,94 @@ class CPUMasterModel:
             self.ce_loss = None
             logger.info("Flash-attn CE not available, using standard PyTorch CE")
 
+    def release_gpu_buffers(self):
+        """Release all GPU-resident buffers to free GPU memory.
+
+        Call this when the GPU is needed for other purposes (e.g., inference engine).
+        Use rebuild_gpu_buffers() to restore them before training resumes.
+        """
+        if not hasattr(self, '_gpu_released') or not self._gpu_released:
+            # Synchronize all streams before releasing
+            torch.cuda.synchronize(self.device)
+
+            # Release double-buffered GPU flat params
+            if hasattr(self, 'gpu_flat_buffers') and self.gpu_flat_buffers is not None:
+                del self.gpu_flat_buffers
+                self.gpu_flat_buffers = None
+
+            # Release GPU layer templates
+            if hasattr(self, 'gpu_layer_templates') and self.gpu_layer_templates is not None:
+                del self.gpu_layer_templates
+                self.gpu_layer_templates = None
+
+            # Release GPU modules
+            if hasattr(self, 'emb_gpu') and self.emb_gpu is not None:
+                del self.emb_gpu
+                self.emb_gpu = None
+            if hasattr(self, 'norm_gpu') and self.norm_gpu is not None:
+                del self.norm_gpu
+                self.norm_gpu = None
+            if hasattr(self, 'lm_head_gpu') and self.lm_head_gpu is not None:
+                del self.lm_head_gpu
+                self.lm_head_gpu = None
+            if hasattr(self, 'rotary_gpu') and self.rotary_gpu is not None:
+                del self.rotary_gpu
+                self.rotary_gpu = None
+
+            self._gpu_released = True
+            torch.cuda.empty_cache()
+            logger.info("Released all GPU buffers from CPUMasterModel")
+
+    def rebuild_gpu_buffers(self):
+        """Rebuild GPU-resident buffers from CPU state.
+
+        Call this before training resumes after release_gpu_buffers().
+        """
+        if not hasattr(self, '_gpu_released') or not self._gpu_released:
+            return  # Already have GPU buffers
+
+        # Rebuild double-buffered GPU flat params
+        self.gpu_flat_buffers = [
+            torch.empty(self.max_layer_numel, dtype=self.config.dtype, device=self.device),
+            torch.empty(self.max_layer_numel, dtype=self.config.dtype, device=self.device)
+        ]
+
+        # Rebuild GPU layer templates
+        self.gpu_layer_templates = {}
+        for gid, group in self.layer_groups.items():
+            representative_idx = group['indices'][0]
+            templates = []
+            for _ in range(2):
+                template = copy.deepcopy(self.cpu_layers[representative_idx])
+                _preserve_attn_implementation(template, self._model_config)
+                template = template.to(self.device)
+                for p in template.parameters():
+                    p.requires_grad_(False)
+                templates.append(template)
+            self.gpu_layer_templates[gid] = templates
+
+        # Rebuild GPU modules from CPU state
+        self.emb_gpu = copy.deepcopy(self.embedding).to(self.device)
+        self.norm_gpu = copy.deepcopy(self.norm).to(self.device) if self.norm else None
+        self.lm_head_gpu = copy.deepcopy(self.lm_head).to(self.device)
+
+        if self.tied_lm_head and hasattr(self.lm_head_gpu, "weight"):
+            self.lm_head_gpu.weight = self.emb_gpu.weight
+
+        self.rotary_gpu = copy.deepcopy(self.rotary_emb).to(self.device) if self.rotary_emb else None
+
+        # Re-initialize synchronization events
+        current_stream = torch.cuda.current_stream(self.device)
+        for i in range(2):
+            self.buffer_free_events[i].record(current_stream)
+            self.template_free_events[i].record(current_stream)
+            self.h2d_done_events[i].record(current_stream)
+        self.param_sync_event.record(current_stream)
+        current_stream.synchronize()
+
+        self._gpu_released = False
+        logger.info("Rebuilt all GPU buffers for CPUMasterModel")
+
     def _get_gpu_layer(self, layer_idx, buffer_idx):
         """Get the GPU layer template for a given layer index and buffer slot."""
         group_id = self.layer_to_group[layer_idx]

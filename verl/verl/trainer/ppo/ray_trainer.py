@@ -307,6 +307,11 @@ class RayPPOTrainer:
             lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
         self.ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
 
+        # MegaTrain: always use ref_in_actor mode (param swap instead of separate engine)
+        actor_strategy = config.actor_rollout_ref.actor.get("strategy", "fsdp")
+        if actor_strategy == "megatrain":
+            self.ref_in_actor = True
+
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:

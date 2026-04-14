@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-MegaTrain GRPO Training Script — Single-GPU RL Training for Large Models
+[DEPRECATED] Standalone MegaTrain GRPO — use VERL integration instead.
 
-Implements Group Relative Policy Optimization (GRPO) using MegaTrain's
-CPU-offloading backend. No vLLM or distributed setup required.
+For production RL training, use the VERL-based scripts:
 
-GRPO generates multiple responses per prompt, computes group-relative
-advantages from rewards, and updates the policy via clipped PPO loss
-with KL regularization to a reference policy.
+    CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh
+    CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen3_5_27b_megatrain.sh
 
-Usage:
+The VERL integration provides SGLang FP8 rollout, proper weight sync,
+ref_in_actor pointer swap, and full GRPO pipeline orchestration.
+
+This standalone script is kept for reference only. It uses simulated
+rollouts (no real LLM generation) and does not support FP8 inference.
+
+Usage (reference only):
     python examples/rl/train_grpo.py --config examples/rl/configs/qwen3_5_27b_grpo.yaml
 """
 

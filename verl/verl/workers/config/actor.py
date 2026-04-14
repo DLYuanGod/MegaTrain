@@ -25,6 +25,7 @@ from verl.utils.qat import QATConfig
 from .engine import (
     FSDPEngineConfig,
     McoreEngineConfig,
+    MegaTrainEngineConfig,
     MindSpeedEngineConfig,
     TorchtitanEngineConfig,
     VeOmniEngineConfig,
@@ -42,6 +43,7 @@ __all__ = [
     "QATConfig",
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
+    "MegaTrainActorConfig",
 ]
 
 
@@ -403,3 +405,20 @@ class MindSpeedActorConfig(ActorConfig):
         """Validate MindSpeed actor configuration parameters."""
         super().__post_init__()
         self.engine = self.mindspeed
+
+
+@dataclass
+class MegaTrainActorConfig(ActorConfig):
+    """Configuration for MegaTrain CPU-memory-centric single-GPU actor.
+
+    Args:
+        strategy (str): Training strategy set to 'megatrain'.
+        megatrain (MegaTrainEngineConfig): Configuration for MegaTrain engine settings.
+    """
+
+    strategy: str = "megatrain"
+    megatrain: MegaTrainEngineConfig = field(default_factory=MegaTrainEngineConfig)
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.engine = self.megatrain

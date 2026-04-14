@@ -1,0 +1,19 @@
+# megatrain actor config, inheriting from trainer/config/actor/actor.yaml
+defaults:
+
+  # fsdp optimizer config (MegaTrain builds its own optimizer but needs the config structure)
+  - ../optim@optim: fsdp
+
+  # megatrain engine config
+  - ../engine@megatrain: megatrain
+
+  - actor
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.MegaTrainActorConfig
+
+# Training strategy
+strategy: megatrain

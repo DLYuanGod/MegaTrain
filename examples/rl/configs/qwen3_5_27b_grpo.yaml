@@ -1,8 +1,13 @@
+# [DEPRECATED] Standalone GRPO config — use VERL-based scripts instead.
+#
+# For production RL training:
+#   CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen3_5_27b_megatrain.sh
+#
+# This file is only used by the deprecated train_grpo.py standalone script.
+# The VERL scripts pass all config via Hydra CLI and do not read this file.
+#
 # Qwen3.5-27B GRPO Configuration
 # Single GPU H100/A100 80GB — MegaTrain + VERL backend
-#
-# Usage:
-#   python examples/rl/train_grpo.py --config examples/rl/configs/qwen3_5_27b_grpo.yaml
 
 model:
   name: "Qwen/Qwen3.5-27B"

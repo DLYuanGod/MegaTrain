@@ -1,0 +1,21 @@
+# megatrain critic config (placeholder - GRPO does not use critic)
+# This file exists so Hydra can resolve ${model_engine}_critic when model_engine=megatrain
+defaults:
+
+  # fsdp optimizer config
+  - ../optim@optim: fsdp
+
+  # megatrain engine config
+  - ../engine@megatrain: megatrain
+
+  # critic config, inheriting from trainer/config/critic/critic.yaml
+  - critic
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Use FSDPCriticConfig as placeholder (critic is not used in GRPO)
+_target_: verl.workers.config.FSDPCriticConfig
+
+# Training strategy
+strategy: fsdp

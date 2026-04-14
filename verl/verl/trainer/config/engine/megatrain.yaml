@@ -1,0 +1,32 @@
+# Target class for this configuration
+_target_: verl.workers.config.MegaTrainEngineConfig
+
+# Training strategy
+strategy: megatrain
+
+# CUDA device index (single GPU)
+device: 0
+
+# HF attention implementation
+attn_implementation: flash_attention_2
+
+# Gradient checkpoint every N layers
+checkpoint_interval: 4
+
+# Number of gradient slab buffers
+num_grad_slabs: 12
+
+# Maximum sequence length for MegaTrain
+max_seq_len: 2048
+
+# MegaTrain always offloads params and optimizer to CPU
+param_offload: True
+
+# MegaTrain always offloads optimizer to CPU
+optimizer_offload: True
+
+# Whether to use forward only
+forward_only: false
+
+# Mixed precision training param dtype
+dtype: bfloat16

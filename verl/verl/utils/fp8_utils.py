@@ -37,6 +37,7 @@ class FP8QuantizerHelper:
         - Exclude embedding layers
         - Exclude normalization layers
         - Exclude output layer (lm_head)
+        - Quantize all other weight tensors (Linear layers)
         """
         # Must be a weight parameter
         if not param_name.endswith(".weight"):
@@ -47,10 +48,13 @@ class FP8QuantizerHelper:
             "embed_tokens",  # Embedding layer
             "lm_head",  # Output layer
             "layernorm",  # LayerNorm
-            "norm",  # Various Norm layers
+            "norm",  # Various Norm layers (RMSNorm, LayerNorm, q_norm, k_norm, etc.)
             "ln_",  # LayerNorm variants
             "embeddings",  # Embeddings
             "mlp.gate.weight",  # MoE router
+            "patch_embed",  # Vision patch embedding
+            "pos_embed",  # Position embedding
+            "conv1d",  # 1D convolutions (e.g. Qwen3.5 linear_attn.conv1d)
         ]
 
         # Check if matches exclude patterns
@@ -59,29 +63,9 @@ class FP8QuantizerHelper:
             if pattern in param_lower:
                 return False
 
-        # Layer types to include (Linear layers)
-        include_patterns = [
-            "q_proj",  # Query projection
-            "k_proj",  # Key projection
-            "v_proj",  # Value projection
-            "o_proj",  # Output projection
-            "gate_proj",  # Gate projection (for MLP)
-            "up_proj",  # Up projection (for MLP)
-            "down_proj",  # Down projection (for MLP)
-            "fc1",  # Fully connected 1
-            "fc2",  # Fully connected 2
-            "mlp",  # MLP layers
-        ]
-
-        # Check if matches include patterns
-        for pattern in include_patterns:
-            if pattern in param_lower:
-                logger.debug(f"Will quantize FP8: {param_name}")
-                return True
-
-        # Do not quantize by default
-        logger.debug(f"Skip quantization: {param_name}")
-        return False
+        # Quantize all remaining .weight parameters (they are Linear layers)
+        logger.debug(f"Will quantize FP8: {param_name}")
+        return True
 
     async def quant_weights_by_name(self, weights, dtype=torch.bfloat16):
         """FP8 quantization based on parameter name using a memory-efficient generator.

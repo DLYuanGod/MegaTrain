@@ -496,41 +496,53 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 1. build reference model
         if "ref" in self.role:
-            # TODO: align ref config with actor config
-            with open_dict(self.config.ref):
-                self.config.ref.ppo_mini_batch_size = self.config.actor.ppo_mini_batch_size
-                self.config.ref.ppo_micro_batch_size = self.config.ref.pop("log_prob_micro_batch_size", None)
-                self.config.ref.ppo_micro_batch_size_per_gpu = self.config.ref.pop(
-                    "log_prob_micro_batch_size_per_gpu", None
+            ref_strategy = self.config.ref.get("strategy", self.config.actor.strategy)
+            self._megatrain_ref_in_actor = (ref_strategy == "megatrain")
+
+            if self._megatrain_ref_in_actor:
+                # MegaTrain: skip creating a separate ref engine.
+                # The actor engine will snapshot its initial weights as frozen
+                # reference params, and use pointer-swap in disable_adapter()
+                # to compute ref log_probs without a second CPUMasterModel.
+                self.ref = None
+            else:
+                # TODO: align ref config with actor config
+                with open_dict(self.config.ref):
+                    self.config.ref.ppo_mini_batch_size = self.config.actor.ppo_mini_batch_size
+                    self.config.ref.ppo_micro_batch_size = self.config.ref.pop("log_prob_micro_batch_size", None)
+                    self.config.ref.ppo_micro_batch_size_per_gpu = self.config.ref.pop(
+                        "log_prob_micro_batch_size_per_gpu", None
+                    )
+                    self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
+                    self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
+                ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
+
+                # The ref model does not need to enable MTP; force it to false.
+                ref_config.model_config = deepcopy(model_config)
+                ref_config.model_config.mtp = MtpConfig(enable=False)
+
+                # construct TrainingWorkerConfig
+                ref_training_config = TrainingWorkerConfig(
+                    model_type="language_model",
+                    model_config=ref_config.model_config,
+                    engine_config=ref_config.engine,
+                    optimizer_config=ref_config.optim,
+                    checkpoint_config=ref_config.checkpoint,
                 )
-                self.config.ref.use_dynamic_bsz = self.config.ref.pop("log_prob_use_dynamic_bsz", False)
-                self.config.ref.ppo_max_token_len_per_gpu = self.config.ref.pop("log_prob_max_token_len_per_gpu", None)
-            ref_config: ActorConfig = omega_conf_to_dataclass(self.config.ref)
 
-            # The ref model does not need to enable MTP; force it to false.
-            ref_config.model_config = deepcopy(model_config)
-            ref_config.model_config.mtp = MtpConfig(enable=False)
+                # assign engine configs
+                ref_training_config.engine_config.use_dynamic_bsz = self.config.ref.use_dynamic_bsz
+                ref_training_config.engine_config.infer_max_token_len_per_gpu = self.config.ref.ppo_max_token_len_per_gpu
+                ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
+                    self.config.ref.ppo_micro_batch_size_per_gpu
+                )
+                ref_training_config.engine_config.use_remove_padding = model_config.use_remove_padding
 
-            # construct TrainingWorkerConfig
-            ref_training_config = TrainingWorkerConfig(
-                model_type="language_model",
-                model_config=ref_config.model_config,
-                engine_config=ref_config.engine,
-                optimizer_config=ref_config.optim,
-                checkpoint_config=ref_config.checkpoint,
-            )
-
-            # assign engine configs
-            ref_training_config.engine_config.use_dynamic_bsz = self.config.ref.use_dynamic_bsz
-            ref_training_config.engine_config.infer_max_token_len_per_gpu = self.config.ref.ppo_max_token_len_per_gpu
-            ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
-                self.config.ref.ppo_micro_batch_size_per_gpu
-            )
-            ref_training_config.engine_config.use_remove_padding = model_config.use_remove_padding
-
-            self.ref = TrainingWorker(config=ref_training_config)
-            self.ref.reset()
-            self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
+                self.ref = TrainingWorker(config=ref_training_config)
+                self.ref.reset()
+                self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
+        else:
+            self._megatrain_ref_in_actor = False
 
         # 2. build actor model
         if "actor" in self.role:
@@ -580,6 +592,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
+
+            # MegaTrain ref_in_actor: snapshot initial weights as frozen reference
+            if self._megatrain_ref_in_actor:
+                self.actor.engine.snapshot_ref_params()
+                # Register "ref" mesh pointing to actor so compute_ref_log_prob dispatch works
+                self.set_dispatch_collect(mesh_name="ref", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine
         if "rollout" in self.role:

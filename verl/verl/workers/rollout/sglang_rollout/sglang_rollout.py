@@ -245,10 +245,15 @@ class ServerAdapter(BaseRollout):
                 from verl.utils.sglang.sglang_fp8_utils import SGLangFP8QuantizerHelper
 
                 logger.info("Convert bf16 weights to fp8 format before loading")
-                fp8_quantizer_helper = SGLangFP8QuantizerHelper(self.model_config.hf_config.quantization_config)
+                quant_config = getattr(self.model_config.hf_config, "quantization_config", None)
+                if quant_config is None:
+                    # Runtime FP8: model is bf16, SGLang quantizes on-the-fly.
+                    # Use the same block size that async_sglang_server passes at init.
+                    quant_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+                fp8_quantizer_helper = SGLangFP8QuantizerHelper(quant_config)
                 weights = fp8_quantizer_helper.quant_weights_by_name(
                     weights,
-                    dtype=self.model_config.hf_config.dtype,
+                    dtype=getattr(self.model_config.hf_config, "dtype", torch.bfloat16),
                 )
             else:
                 weights = weights

@@ -466,10 +466,34 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
-                data_dict[key] = torch.nested.as_nested_tensor(
-                    [tensor_lst[idx] for idx in indices], layout=torch.jagged
-                )
+                ragged_idx = getattr(tensor, '_ragged_idx', 1)
+                if ragged_idx != 1:
+                    # For nested tensors with non-default ragged index (e.g. 3D position_ids
+                    # with _ragged_idx=2), both unbind() and __getitem__ are broken in
+                    # PyTorch — they incorrectly split along the wrong dimension.
+                    # Manually slice the underlying values using offsets.
+                    values = tensor.values()  # (total_ragged, *rest)
+                    offsets = tensor.offsets()  # (B+1,)
+                    selected = []
+                    for idx in indices:
+                        start = offsets[idx].item()
+                        end = offsets[idx + 1].item()
+                        selected.append(values[start:end])
+                    result = torch.nested.as_nested_tensor(selected, layout=torch.jagged)
+                    result._ragged_idx = ragged_idx
+                    data_dict[key] = result
+                else:
+                    # Use values/offsets slicing for robustness (avoids unbind issues).
+                    values = tensor.values()  # (total_nnz, *rest)
+                    offsets = tensor.offsets()  # (B+1,)
+                    selected = []
+                    for idx in indices:
+                        start = offsets[idx].item()
+                        end = offsets[idx + 1].item()
+                        selected.append(values[start:end])
+                    data_dict[key] = torch.nested.as_nested_tensor(
+                        selected, layout=torch.jagged
+                    )
             else:
                 # This handles NonTensorStack (indexable by batch dim) and NonTensorData (scalar metadata).
                 if tensor.shape:

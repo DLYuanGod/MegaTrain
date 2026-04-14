@@ -47,8 +47,8 @@ python examples/sft/train.py --config examples/sft/configs/llama3_8b.yaml
 # SFT: Train any supported model
 python examples/sft/train.py --config examples/sft/configs/qwen3_5_27b.yaml
 
-# RL (GRPO): Single-GPU RL training
-python examples/rl/train_grpo.py --config examples/rl/configs/qwen3_5_27b_grpo.yaml
+# RL (GRPO): Single-GPU GRPO via VERL + MegaTrain + SGLang
+CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh
 ```
 
 ## Supported Models
@@ -156,7 +156,7 @@ optimizer:
 ```
 
 See [`examples/sft/configs/`](examples/sft/configs/) for ready-made SFT configurations.
-See [`examples/rl/configs/`](examples/rl/configs/) for GRPO configurations.
+See [`examples/rl/`](examples/rl/) for GRPO training scripts (VERL + MegaTrain).
 
 | Config | Model | Architecture |
 |:-------|:------|:-------------|
@@ -171,35 +171,85 @@ See [`examples/rl/configs/`](examples/rl/configs/) for GRPO configurations.
 
 ## RL Training (GRPO)
 
-MegaTrain supports **single-GPU RL post-training** via GRPO (Group Relative Policy Optimization), integrated with the [VERL](https://github.com/verl-project/verl) framework as a training backend.
+MegaTrain supports **single-GPU RL post-training** via GRPO (Group Relative Policy Optimization), fully integrated with the [VERL](https://github.com/verl-project/verl) framework.
 
+### Architecture
+
+On a single GPU, three components coexist without weight reloading:
+
+| Component | Where | GPU Memory |
+|:----------|:------|:-----------|
+| **SGLang (FP8)** | GPU — rollout inference | ~3.5 GB/B params (FP8 weights + KV cache) |
+| **MegaTrain** | CPU→GPU — actor & ref training | ~4-9 GB transient (layer-by-layer streaming) |
+| **VERL** | Orchestration — data, advantages, logging | Minimal |
+
+MegaTrain stores all parameters and optimizer states in CPU RAM (~12 GB per 1B params). The GPU only holds one layer at a time during training, while SGLang's FP8 model weights stay resident for fast rollout generation.
 
 ### Quick Start
 
 ```bash
-# GRPO training with Qwen3.5-27B on GSM8K
-python examples/rl/train_grpo.py --config examples/rl/configs/qwen3_5_27b_grpo.yaml
+# Qwen2.5-7B — recommended starting point (fast iteration, fits easily on 80GB)
+CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh
+
+# Qwen3.5-27B — full-scale single-GPU GRPO
+CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen3_5_27b_megatrain.sh
 ```
 
-### VERL Backend Integration
+Use a local model path instead of downloading from HuggingFace:
 
-MegaTrain also works as a **VERL training backend** (`MegaTrainEngine`), enabling integration with VERL's full RL pipeline (rollout via vLLM + training via MegaTrain):
-
-```python
-# In VERL config
-actor_rollout_ref.actor.strategy = "megatrain"
+```bash
+MODEL_PATH=/path/to/Qwen2.5-7B \
+CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh
 ```
 
+Override any parameter via Hydra CLI:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh \
+    data.train_batch_size=16 \
+    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.actor.optim.lr=5e-7
+```
+
+### Tested Configurations (Single H100 80GB, GSM8K)
+
+| Model | Batch Size | n | GPU Memory | Time/Step | Throughput |
+|:------|:-----------|:--|:-----------|:----------|:-----------|
+| Qwen2.5-7B | 8 | 2 | ~62 GB | ~60s | ~120 tok/s |
+| Qwen3.5-27B | 2 | 2 | ~50 GB | ~230s | ~24 tok/s |
+
+### Configuration Reference
+
+All parameters are standard VERL Hydra configs. Key MegaTrain-specific knobs:
+
+```bash
+# Use MegaTrain as training backend (actor + reference)
+model_engine=megatrain
+actor_rollout_ref.actor.strategy=megatrain
+actor_rollout_ref.ref.strategy=megatrain
+
+# MegaTrain engine tuning
+actor_rollout_ref.actor.megatrain.checkpoint_interval=4    # gradient checkpoint every N layers
+actor_rollout_ref.actor.megatrain.num_grad_slabs=12        # async gradient buffer count
+actor_rollout_ref.actor.megatrain.max_seq_len=1536         # max sequence length
+
+# SGLang FP8 rollout
+actor_rollout_ref.rollout.name=sglang
+actor_rollout_ref.rollout.quantization=fp8
+actor_rollout_ref.rollout.gpu_memory_utilization=0.5       # fraction for KV cache (after model weights)
+```
+
+See [`examples/rl/`](examples/rl/) for ready-to-run scripts.
 See [`verl/workers/engine/megatrain/`](verl/workers/engine/megatrain/) for the engine implementation.
-
 
 ### Key Techniques
 
-- **Double buffering** for overlapped weight transfer between CPU and GPU
+- **Double buffering** for overlapped CPU→GPU weight transfer
 - **Per-layer structure grouping** for hybrid/MoE architectures
 - **Gradient checkpointing** every K layers to reduce GPU memory
-- **Async gradient collection** with slab pool
-- **Manual gradient computation** (no autograd overhead)
+- **Async gradient collection** with slab pool and worker thread
+- **FP8 quantized rollout** via SGLang for 2x memory savings on inference
+- **ref_in_actor pointer swap** — zero-cost reference log-prob computation
 - **HuggingFace native Flash Attention** integration
 - **DeepSpeed CPUAdam** for 5-7x faster optimizer steps
 
@@ -214,6 +264,10 @@ pip install -e .
 pip install flash-attn
 pip install flash-linear-attention causal-conv1d  # for Qwen3.5 linear attention
 pip install deepspeed                              # for CPUAdam optimizer
+
+# Required for RL (GRPO) training
+pip install verl                                   # VERL framework
+pip install sglang[all]                            # SGLang rollout engine
 ```
 
 ## Troubleshooting

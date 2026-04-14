@@ -128,6 +128,12 @@ class TaskRunner:
 
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
+        # Auto-detect: strategies that only support new engine worker must use "disable"
+        if use_legacy_worker_impl == "auto" and config.actor_rollout_ref.actor.strategy in {
+            "veomni", "torchtitan", "mindspeed", "megatrain"
+        }:
+            use_legacy_worker_impl = "disable"
+
         # use new model engine implementation
         if use_legacy_worker_impl == "disable":
             from verl.workers.engine_workers import ActorRolloutRefWorker
@@ -290,6 +296,10 @@ class TaskRunner:
         # Ref policy has been fused into ActorRolloutRefWorker in new model engine,
         # we don't need to add a separate ref policy worker group.
         use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        if use_legacy_worker_impl == "auto" and config.actor_rollout_ref.actor.strategy in {
+            "veomni", "torchtitan", "mindspeed", "megatrain"
+        }:
+            use_legacy_worker_impl = "disable"
         if use_legacy_worker_impl == "disable":
             return
 

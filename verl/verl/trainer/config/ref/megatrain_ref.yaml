@@ -1,0 +1,25 @@
+# megatrain ref config, inheriting from trainer/config/ref/ref.yaml
+defaults:
+
+  # fsdp optimizer config (ref model is forward-only, but needs config structure)
+  - ../optim@optim: fsdp
+
+  # megatrain engine config
+  - ../engine@megatrain: megatrain
+
+  - ref
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+# Target class for this configuration
+_target_: verl.workers.config.MegaTrainActorConfig
+
+# Training strategy
+strategy: megatrain
+
+# Engine overrides for ref (forward-only)
+megatrain:
+
+  # ref model is forward only
+  forward_only: True
