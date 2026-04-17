@@ -21,12 +21,14 @@
 
 ## 🚀 News
 
+- **4/17/2025:** Multi-GPU data parallelism — 4x H100 achieves **4.7x super-linear speedup** over single GPU (1290 vs 272 TFLOPS on Qwen2.5-7B). No NCCL required — workers read from shared memory independently. Thanks to [@ckgresla](https://github.com/ckgresla) for the initial multi-GPU PR that inspired this implementation!
 - **4/12/2025:** Fully integrated with the [VERL](https://github.com/verl-project/verl) framework — single H100 GPU GRPO training for Qwen3.5-27B. See [RL Training](#rl-training-grpo).
 
 
 ## Features
 
 - **Single GPU, Massive Models** -- Train 120B+ models on one GPU by leveraging CPU RAM for parameter storage
+- **Multi-GPU Data Parallelism** -- Scale to multiple GPUs with super-linear speedup via spawn-based workers (no NCCL)
 - **Universal Model Support** -- Any HuggingFace decoder-only model works out of the box via `AutoModelForCausalLM`
 - **Hybrid Architecture** -- Automatic handling of mixed attention (linear + full) and MoE layers
 - **LlamaFactory-style Data** -- Flexible `dataset_info.json` registry with alpaca/sharegpt format support
@@ -46,6 +48,9 @@ python examples/sft/train.py --config examples/sft/configs/llama3_8b.yaml
 
 # SFT: Train any supported model
 python examples/sft/train.py --config examples/sft/configs/qwen3_5_27b.yaml
+
+# SFT: Multi-GPU data parallel (no NCCL needed)
+python examples/sft/train.py --config examples/sft/configs/qwen_7b_4gpu.yaml
 
 # RL (GRPO): Single-GPU GRPO via VERL + MegaTrain + SGLang
 CUDA_VISIBLE_DEVICES=0 bash examples/rl/run_qwen2_5_7b_megatrain.sh

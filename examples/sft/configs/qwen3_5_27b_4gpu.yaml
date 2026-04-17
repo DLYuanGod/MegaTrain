@@ -1,0 +1,37 @@
+# Qwen 3.5 27B — 4x H100 Data Parallel Configuration
+
+model:
+  name: "/media/volume/Model/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd"
+  dtype: "bfloat16"
+  devices: [0, 1, 2, 3]
+  attn_implementation: "flash_attention_2"
+  trust_remote_code: true
+
+dataset:
+  name: "gsm8k"
+  dataset_dir: "data"
+  max_seq_len: 1024
+  num_workers: 4
+
+training:
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  num_steps: 3
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+
+optimizer:
+  type: "deepspeed_adam"
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-8
+
+memory:
+  checkpoint_interval: 4
+  num_grad_slabs: 12
+
+logging:
+  log_interval: 1
+  enable_timing: true

@@ -1,6 +1,7 @@
 """Training configuration for CPU Master model."""
 
 from dataclasses import dataclass, field
+from typing import List
 import torch
 
 
@@ -40,6 +41,7 @@ class CPUMasterConfig:
     # Model
     model_name: str = "Qwen/Qwen2.5-32B-Instruct"
     device: int = 0
+    devices: List[int] = field(default_factory=lambda: [])
     dtype: torch.dtype = torch.bfloat16
     attn_implementation: str = "flash_attention_2"
     trust_remote_code: bool = True
@@ -82,6 +84,17 @@ class CPUMasterConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        # Multi-GPU: resolve devices list
+        if not self.devices:
+            self.devices = [self.device]
+        self.world_size = len(self.devices)
+
+        if self.world_size > 1 and self.batch_size % self.world_size != 0 and self.dataset_path != "__verl__":
+            raise ValueError(
+                f"batch_size ({self.batch_size}) must be divisible by "
+                f"world_size ({self.world_size}) for multi-GPU data parallelism"
+            )
+
         if self.num_grad_slabs < 2 * self.checkpoint_interval:
             import warnings
             warnings.warn(

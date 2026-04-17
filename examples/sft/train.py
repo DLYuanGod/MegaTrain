@@ -53,10 +53,16 @@ def parse_args():
                         help="Override model name from config")
     parser.add_argument("--dataset-path", type=str, default=None,
                         help="Override dataset path from config")
+    parser.add_argument("--dataset-name", type=str, default=None,
+                        help="Dataset name from dataset_info.json")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size from config")
+    parser.add_argument("--max-seq-len", type=int, default=None,
+                        help="Override max sequence length from config")
     parser.add_argument("--num-steps", type=int, default=None,
                         help="Override number of training steps from config")
+    parser.add_argument("--devices", type=str, default=None,
+                        help="Comma-separated GPU device IDs (e.g., '0,1,2,3')")
     return parser.parse_args()
 
 
@@ -96,20 +102,34 @@ def main():
         config.model_name = args.model_name
     if args.dataset_path:
         config.dataset_path = args.dataset_path
+    if args.dataset_name:
+        config.dataset_name = args.dataset_name
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.max_seq_len:
+        config.max_seq_len = args.max_seq_len
     if args.num_steps:
         config.num_steps = args.num_steps
+    if args.devices:
+        config.devices = [int(d) for d in args.devices.split(',')]
+        config.world_size = len(config.devices)
 
     logger.info("=" * 70)
-    logger.info("MEGATRAIN: RAM-CENTRIC SINGLE-GPU TRAINING")
+    if config.world_size > 1:
+        logger.info("MEGATRAIN: RAM-CENTRIC MULTI-GPU DATA PARALLEL TRAINING")
+    else:
+        logger.info("MEGATRAIN: RAM-CENTRIC SINGLE-GPU TRAINING")
     logger.info("=" * 70)
     logger.info(f"Model: {config.model_name}")
     logger.info(f"Attention: {config.attn_implementation}")
-    logger.info(f"Dataset: {config.dataset_path}")
-    logger.info(f"Batch size: {config.batch_size}")
+    logger.info(f"Dataset: {config.dataset_path or config.dataset_name}")
+    logger.info(f"Batch size: {config.batch_size}" +
+                (f" ({config.batch_size // config.world_size} per GPU x {config.world_size} GPUs)"
+                 if config.world_size > 1 else ""))
     logger.info(f"Training steps: {config.num_steps}")
     logger.info(f"Learning rate: {config.learning_rate}")
+    if config.world_size > 1:
+        logger.info(f"Devices: {config.devices}")
 
     torch.manual_seed(config.seed)
 
@@ -207,7 +227,8 @@ def main():
     # Training metrics
     total_loss = 0.0
     losses = []
-    torch.cuda.reset_peak_memory_stats()
+    for dev_id in config.devices:
+        torch.cuda.reset_peak_memory_stats(dev_id)
 
     step_times = []
     throughputs = []
@@ -253,18 +274,19 @@ def main():
         step_time = time.perf_counter() - start_time
 
         # Calculate metrics
-        gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+        gpu_mem = max(torch.cuda.max_memory_allocated(d) for d in config.devices) / 1024**3
         cpu_mem = process.memory_info().rss / 1024**3
 
         num_params = sum(p.numel() for p in model.get_parameters())
-        flops = 6 * num_params * n_tokens
-        gflops = (flops / 1e9) / step_time
+        total_seq_tokens = config.batch_size * config.max_seq_len
+        flops = 6 * num_params * total_seq_tokens
+        tflops = (flops / 1e12) / step_time
 
         fwd_time = timing['forward']
         bwd_time = timing['backward']
 
         step_times.append(step_time)
-        throughputs.append(gflops)
+        throughputs.append(tflops)
         gpu_mems.append(gpu_mem)
         cpu_mems.append(cpu_mem)
 
@@ -274,14 +296,14 @@ def main():
         # Logging
         if (step + 1) % config.log_interval == 0:
             avg_loss = total_loss / (step + 1)
-            tps = n_tokens / step_time
-            mem_alloc = torch.cuda.memory_allocated() / 1024**3
-            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            tps = total_seq_tokens / step_time
+            mem_alloc = max(torch.cuda.memory_allocated(d) for d in config.devices) / 1024**3
+            mem_reserved = max(torch.cuda.memory_reserved(d) for d in config.devices) / 1024**3
 
             logger.info(f"Step {step+1}/{config.num_steps} | Loss {loss_val:.4f} | Avg {avg_loss:.4f}")
-            logger.info(f"  Time: {step_time:.2f}s | Tokens/s {tps:.1f} | GFLOPS {gflops:.1f}")
+            logger.info(f"  Time: {step_time:.2f}s | Tokens/s {tps:.1f} | TFLOPS {tflops:.1f}")
             logger.info(f"  FWD: {fwd_time:.2f}s | BWD: {bwd_time:.2f}s")
-            logger.info(f"  GPU: {gpu_mem:.2f}GB (alloc {mem_alloc:.2f}GB / reserved {mem_reserved:.2f}GB)")
+            logger.info(f"  GPU: {gpu_mem:.2f}GB peak (alloc {mem_alloc:.2f}GB / reserved {mem_reserved:.2f}GB)")
             logger.info(f"  CPU: {cpu_mem:.2f}GB")
 
     # Training summary
@@ -293,12 +315,14 @@ def main():
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
     logger.info(f"Loss: {initial_loss:.4f} -> {final_loss:.4f} ({loss_reduction:.1f}% reduction)")
-    logger.info(f"Peak GPU: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
+    peak_gpu = max(torch.cuda.max_memory_allocated(d) for d in config.devices) / 1024**3
+    logger.info(f"Peak GPU: {peak_gpu:.2f} GB" +
+                (f" (per device, {config.world_size} GPUs)" if config.world_size > 1 else ""))
     logger.info(f"Peak CPU: {max(cpu_mems):.2f} GB")
     logger.info("")
     logger.info("Performance Metrics:")
     logger.info(f"  Avg Latency: {sum(step_times)/len(step_times):.3f}s per step")
-    logger.info(f"  Avg Throughput: {sum(throughputs)/len(throughputs):.1f} GFLOPS")
+    logger.info(f"  Avg Throughput: {sum(throughputs)/len(throughputs):.1f} TFLOPS")
 
     # Cleanup
     model.cleanup()
