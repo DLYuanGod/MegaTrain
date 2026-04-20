@@ -1,0 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MegaTrain Resource Calculator</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #232735;
+    --border: #2e3347;
+    --accent: #6c5ce7;
+    --accent-glow: rgba(108, 92, 231, 0.25);
+    --accent-light: #a29bfe;
+    --green: #00cec9;
+    --green-dim: rgba(0, 206, 201, 0.15);
+    --red: #ff6b6b;
+    --red-dim: rgba(255, 107, 107, 0.15);
+    --yellow: #feca57;
+    --yellow-dim: rgba(254, 202, 87, 0.15);
+    --text: #e4e6f0;
+    --text-dim: #8b8fa3;
+    --text-muted: #5a5e73;
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+
+  /* ── Header ── */
+  .header {
+    text-align: center;
+    padding: 48px 24px 32px;
+    position: relative;
+  }
+  .header::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 200px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  }
+  .logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+  .logo-icon {
+    width: 44px; height: 44px;
+    background: linear-gradient(135deg, var(--accent), var(--green));
+    border-radius: 12px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; font-weight: 700; color: #fff;
+    box-shadow: 0 4px 20px var(--accent-glow);
+  }
+  .logo-text {
+    font-size: 28px;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--accent-light), var(--green));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .header p {
+    color: var(--text-dim);
+    font-size: 15px;
+    margin-top: 4px;
+  }
+
+  /* ── Container ── */
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+  }
+
+  /* ── Mode Tabs ── */
+  .mode-tabs {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 32px;
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 6px;
+    border: 1px solid var(--border);
+  }
+  .mode-tab {
+    flex: 1;
+    padding: 14px 20px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.25s ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .mode-tab:hover { color: var(--text); background: var(--surface2); }
+  .mode-tab.active {
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 2px 12px var(--accent-glow);
+  }
+  .mode-tab .icon { font-size: 18px; }
+
+  /* ── Panels ── */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── Card ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    margin-bottom: 24px;
+  }
+  .card-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+  }
+  .card-title .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+
+  /* ── Form controls ── */
+  .form-row {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+  }
+  .form-group {
+    flex: 1;
+    min-width: 200px;
+  }
+  .form-group label {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .form-group input,
+  .form-group select {
+    width: 100%;
+    padding: 12px 16px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .form-group input:focus,
+  .form-group select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  .form-group select { cursor: pointer; -webkit-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b8fa3' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 14px center;
+    padding-right: 36px;
+  }
+  .form-group .hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 6px;
+  }
+
+  /* ── Button ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 14px 32px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: all 0.25s;
+    font-family: inherit;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), #7c6cf0);
+    color: #fff;
+    box-shadow: 0 4px 16px var(--accent-glow);
+  }
+  .btn-primary:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 24px var(--accent-glow);
+  }
+  .btn-primary:active { transform: translateY(0); }
+
+  /* ── Results ── */
+  .results { margin-top: 24px; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 20px;
+    text-align: center;
+  }
+  .stat-card .stat-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 8px;
+  }
+  .stat-card .stat-value {
+    font-size: 28px;
+    font-weight: 800;
+  }
+  .stat-card .stat-unit {
+    font-size: 14px;
+    color: var(--text-dim);
+    margin-left: 4px;
+  }
+  .stat-card.primary .stat-value { color: var(--accent-light); }
+  .stat-card.success .stat-value { color: var(--green); }
+  .stat-card.warning .stat-value { color: var(--yellow); }
+  .stat-card.danger .stat-value { color: var(--red); }
+
+  /* ── Batch size visual ── */
+  .batch-visual {
+    display: flex;
+    gap: 12px;
+    margin: 20px 0;
+    flex-wrap: wrap;
+  }
+  .batch-bar {
+    flex: 1;
+    min-width: 150px;
+    padding: 16px 20px;
+    border-radius: var(--radius-sm);
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+  .batch-bar .bar-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  .batch-bar .bar-value {
+    font-size: 24px;
+    font-weight: 800;
+  }
+  .batch-bar.safe { background: var(--green-dim); color: var(--green); border: 1px solid rgba(0,206,201,0.3); }
+  .batch-bar.recommended { background: var(--accent-glow); color: var(--accent-light); border: 1px solid rgba(108,92,231,0.4); }
+  .batch-bar.aggressive { background: var(--yellow-dim); color: var(--yellow); border: 1px solid rgba(254,202,87,0.3); }
+
+  /* ── Model table ── */
+  .model-table-wrap {
+    overflow-x: auto;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  th {
+    background: var(--surface2);
+    padding: 14px 16px;
+    text-align: left;
+    font-weight: 700;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(108, 92, 231, 0.05); }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .badge-ok { background: var(--green-dim); color: var(--green); }
+  .badge-fail { background: var(--red-dim); color: var(--red); }
+
+  /* ── Note box ── */
+  .note-box {
+    background: var(--surface2);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    padding: 16px 20px;
+    margin-top: 16px;
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.7;
+  }
+  .note-box strong { color: var(--text); }
+  .note-box.warn { border-left-color: var(--yellow); }
+
+  /* ── Config snippet ── */
+  .config-snippet {
+    background: #0d0f14;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 20px 24px;
+    margin-top: 16px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--text-dim);
+    position: relative;
+  }
+  .config-snippet .key { color: var(--green); }
+  .config-snippet .val { color: var(--yellow); }
+  .config-snippet .comment { color: var(--text-muted); }
+  .copy-btn {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.2s;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
+
+  /* ── Error ── */
+  .error-box {
+    background: var(--red-dim);
+    border: 1px solid rgba(255,107,107,0.3);
+    border-radius: var(--radius-sm);
+    padding: 20px 24px;
+    text-align: center;
+    color: var(--red);
+    font-weight: 600;
+    font-size: 15px;
+  }
+  .error-box .sub {
+    font-weight: 400;
+    font-size: 13px;
+    margin-top: 6px;
+    color: var(--text-dim);
+  }
+
+  /* ── Custom fields ── */
+  .custom-fields {
+    display: none;
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px dashed var(--border);
+  }
+  .custom-fields.show { display: block; }
+
+  /* ── Footer ── */
+  .footer {
+    text-align: center;
+    padding: 32px 24px;
+    color: var(--text-muted);
+    font-size: 13px;
+    border-top: 1px solid var(--border);
+    margin-top: 48px;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 640px) {
+    .container { padding: 20px 16px 48px; }
+    .card { padding: 20px; }
+    .form-row { flex-direction: column; gap: 12px; }
+    .form-group { min-width: 100%; }
+    .stat-grid { grid-template-columns: 1fr 1fr; }
+    .batch-visual { flex-direction: column; }
+    .mode-tab { padding: 12px 14px; font-size: 13px; }
+    .mode-tab .label-full { display: none; }
+    .mode-tab .label-short { display: inline; }
+  }
+  @media (min-width: 641px) {
+    .mode-tab .label-short { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="logo">
+    <div class="logo-icon">S</div>
+    <span class="logo-text">MegaTrain</span>
+  </div>
+  <p>Resource Calculator — Estimate CPU/GPU requirements &amp; optimal batch size</p>
+</div>
+
+<div class="container">
+
+  <!-- Mode Tabs -->
+  <div class="mode-tabs">
+    <button class="mode-tab active" onclick="switchMode(1)">
+      <span class="icon">🧠</span>
+      <span class="label-full">CPU Memory → Trainable Models</span>
+      <span class="label-short">CPU → Models</span>
+    </button>
+    <button class="mode-tab" onclick="switchMode(2)">
+      <span class="icon">⚡</span>
+      <span class="label-full">GPU Memory + Model → Batch Size</span>
+      <span class="label-short">GPU → Batch</span>
+    </button>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════ -->
+  <!-- Mode 1: CPU Memory -->
+  <!-- ════════════════════════════════════════════════════ -->
+  <div class="panel active" id="panel1">
+    <div class="card">
+      <div class="card-title"><span class="dot"></span>CPU Memory Configuration</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>CPU Memory (GB)</label>
+          <input type="number" id="cpuMem" value="256" min="1" step="1" placeholder="e.g. 256">
+          <div class="hint">Total system RAM available for training</div>
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="calcCPU()">
+        <span>🔍</span> Analyze Trainable Models
+      </button>
+    </div>
+    <div id="cpuResults" class="results"></div>
+  </div>
+
+  <!-- ════════════════════════════════════════════════════ -->
+  <!-- Mode 2: GPU Batch Size -->
+  <!-- ════════════════════════════════════════════════════ -->
+  <div class="panel" id="panel2">
+    <div class="card">
+      <div class="card-title"><span class="dot"></span>GPU & Model Configuration</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>GPU Memory (GB)</label>
+          <input type="number" id="gpuMem" value="80" min="1" step="1" placeholder="e.g. 80">
+          <div class="hint">e.g. 24 (3090), 40 (A100-40G), 80 (H100)</div>
+        </div>
+        <div class="form-group">
+          <label>Context Length</label>
+          <input type="number" id="seqLen" value="1024" min="128" step="128" placeholder="e.g. 1024">
+          <div class="hint">Sequence length per sample</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Model</label>
+          <select id="modelSelect" onchange="onModelChange()">
+          </select>
+        </div>
+      </div>
+
+      <!-- Custom model fields -->
+      <div class="custom-fields" id="customFields">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Parameters (Billions)</label>
+            <input type="number" id="customParams" value="7" min="0.1" step="0.1" placeholder="e.g. 7">
+          </div>
+          <div class="form-group">
+            <label>Hidden Dimension</label>
+            <input type="number" id="customHidden" value="4096" min="64" step="64" placeholder="e.g. 4096">
+          </div>
+          <div class="form-group">
+            <label>Number of Layers</label>
+            <input type="number" id="customLayers" value="32" min="1" step="1" placeholder="e.g. 32">
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-primary" onclick="calcGPU()" style="margin-top:8px">
+        <span>⚡</span> Calculate Batch Size
+      </button>
+    </div>
+    <div id="gpuResults" class="results"></div>
+  </div>
+
+</div>
+
+<div class="footer">
+  MegaTrain Resource Calculator &middot; Estimates based on BF16 training with activation checkpointing
+</div>
+
+<script>
+// ================================================================
+// Known Models (ported from Python)
+// ================================================================
+const KNOWN_MODELS = {
+  // Qwen 2.5
+  "Qwen2.5-0.5B":  {params:0.5, hidden:896, layers:24},
+  "Qwen2.5-1.5B":  {params:1.5, hidden:1536, layers:28},
+  "Qwen2.5-3B":    {params:3, hidden:2048, layers:36},
+  "Qwen2.5-7B":    {params:7, hidden:3584, layers:28},
+  "Qwen2.5-14B":   {params:14, hidden:5120, layers:48},
+  "Qwen2.5-32B":   {params:32, hidden:5120, layers:64},
+  "Qwen2.5-72B":   {params:72, hidden:8192, layers:80},
+  // Qwen 3
+  "Qwen3-0.6B":    {params:0.6, hidden:1024, layers:28},
+  "Qwen3-1.7B":    {params:1.7, hidden:1536, layers:28},
+  "Qwen3-4B":      {params:4, hidden:2560, layers:36},
+  "Qwen3-8B":      {params:8, hidden:4096, layers:36},
+  "Qwen3-14B":     {params:14, hidden:5120, layers:48},
+  "Qwen3-32B":     {params:32, hidden:5120, layers:64},
+  // Qwen 3.5
+  "Qwen3.5-0.8B":  {params:0.8, hidden:1024, layers:28, hybrid:true},
+  "Qwen3.5-2B":    {params:2, hidden:1536, layers:28, hybrid:true},
+  "Qwen3.5-4B":    {params:4, hidden:2560, layers:36, hybrid:true},
+  "Qwen3.5-9B":    {params:9, hidden:4096, layers:36, hybrid:true},
+  "Qwen3.5-27B":   {params:27, hidden:5120, layers:64, hybrid:true},
+  // Llama 2
+  "Llama2-7B":     {params:7, hidden:4096, layers:32},
+  "Llama2-13B":    {params:13, hidden:5120, layers:40},
+  "Llama2-70B":    {params:70, hidden:8192, layers:80},
+  // Llama 3 / 3.1
+  "Llama3-1B":     {params:1, hidden:2048, layers:16},
+  "Llama3-3B":     {params:3, hidden:3072, layers:28},
+  "Llama3-8B":     {params:8, hidden:4096, layers:32},
+  "Llama3-70B":    {params:70, hidden:8192, layers:80},
+  // Mistral / Mixtral
+  "Mistral-7B":    {params:7, hidden:4096, layers:32},
+  "Mixtral-8x7B":  {params:47, hidden:4096, layers:32, moe:true},
+  "Mixtral-8x22B": {params:141, hidden:6144, layers:56, moe:true},
+  // DeepSeek
+  "DeepSeek-7B":   {params:7, hidden:4096, layers:30},
+  "DeepSeek-R1-8B":{params:8, hidden:4096, layers:32},
+  "DeepSeek-67B":  {params:67, hidden:8192, layers:95},
+  // Phi
+  "Phi3-3.8B":     {params:3.8, hidden:3072, layers:32},
+  "Phi4-14B":      {params:14, hidden:5120, layers:40},
+  // Gemma
+  "Gemma2-9B":     {params:9, hidden:3584, layers:42},
+  "Gemma3-27B":    {params:27, hidden:5120, layers:62},
+  // GLM
+  "GLM4-9B":       {params:9, hidden:4096, layers:40},
+  "GLM4-32B":      {params:32, hidden:5120, layers:60},
+  // Others
+  "InternLM2-7B":  {params:7, hidden:4096, layers:32},
+  "InternLM2-20B": {params:20, hidden:5120, layers:48},
+  "Yi1.5-6B":      {params:6, hidden:4096, layers:32},
+  "Yi1.5-9B":      {params:9, hidden:4096, layers:48},
+  "Yi1.5-34B":     {params:34, hidden:7168, layers:60},
+  "GPT-OSS-20B":   {params:20, hidden:5120, layers:48},
+  "GPT-OSS-120B":  {params:120, hidden:10240, layers:96},
+};
+
+const ACTIVATION_BYTES_FACTOR = 29;
+const CUDA_CONTEXT_GB = 2.0;
+const DEFAULT_CHECKPOINT_INTERVAL = 4;
+const DEFAULT_NUM_GRAD_SLABS = 12;
+const HYBRID_OVERHEAD_FACTOR = 2.5;
+
+// ================================================================
+// Calculation functions
+// ================================================================
+function calcCpuMemory(paramsBillion) {
+  return paramsBillion * 12;
+}
+
+function calcGpuFixed(paramsBillion, numLayers, numGradSlabs = DEFAULT_NUM_GRAD_SLABS) {
+  const layerParams = paramsBillion * 1e9 / numLayers;
+  const layerBf16Gb = layerParams * 2 / 1e9;
+  const layerFp32Gb = layerParams * 4 / 1e9;
+  const doubleBuf = 2 * layerBf16Gb;
+  const gradSlabs = numGradSlabs * layerFp32Gb;
+  const headEmbed = 2 * layerFp32Gb;
+  return CUDA_CONTEXT_GB + doubleBuf + gradSlabs + headEmbed;
+}
+
+function calcBatchSize(gpuMemGb, paramsBillion, hiddenDim, numLayers, seqLen,
+                       checkpointInterval = DEFAULT_CHECKPOINT_INTERVAL, isHybrid = false) {
+  const fixed = calcGpuFixed(paramsBillion, numLayers);
+  const available = gpuMemGb - fixed;
+  if (available <= 0) return 0;
+  let actPerSample = hiddenDim * seqLen * checkpointInterval * ACTIVATION_BYTES_FACTOR / 1e9;
+  if (isHybrid) actPerSample *= HYBRID_OVERHEAD_FACTOR;
+  const bs = Math.floor(available / actPerSample);
+  return Math.max(bs, 1);
+}
+
+// ================================================================
+// UI helpers
+// ================================================================
+function switchMode(mode) {
+  document.querySelectorAll('.mode-tab').forEach((t, i) => t.classList.toggle('active', i === mode - 1));
+  document.querySelectorAll('.panel').forEach((p, i) => p.classList.toggle('active', i === mode - 1));
+}
+
+function populateModelSelect() {
+  const sel = document.getElementById('modelSelect');
+  const sorted = Object.entries(KNOWN_MODELS).sort((a, b) => a[1].params - b[1].params);
+
+  // Group by family
+  const families = {};
+  sorted.forEach(([name, spec]) => {
+    const family = name.replace(/-[\d\.]+B$/, '').replace(/-\d+x\d+B$/, '');
+    if (!families[family]) families[family] = [];
+    let tag = '';
+    if (spec.hybrid) tag = ' [hybrid]';
+    else if (spec.moe) tag = ' [MoE]';
+    families[family].push({name, spec, tag});
+  });
+
+  // Flat sorted list approach for simplicity
+  sorted.forEach(([name, spec]) => {
+    let tag = '';
+    if (spec.hybrid) tag = ' [hybrid]';
+    else if (spec.moe) tag = ' [MoE]';
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = `${name} (${spec.params}B)${tag}`;
+    sel.appendChild(opt);
+  });
+
+  // Custom option
+  const custom = document.createElement('option');
+  custom.value = '__custom__';
+  custom.textContent = '✏️ Custom (enter params manually)';
+  sel.appendChild(custom);
+
+  // Default to Qwen2.5-7B
+  sel.value = 'Qwen2.5-7B';
+}
+
+function onModelChange() {
+  const v = document.getElementById('modelSelect').value;
+  document.getElementById('customFields').classList.toggle('show', v === '__custom__');
+}
+
+// ================================================================
+// Mode 1: CPU calculation
+// ================================================================
+function calcCPU() {
+  const cpuMem = parseFloat(document.getElementById('cpuMem').value);
+  if (isNaN(cpuMem) || cpuMem <= 0) { alert('Please enter a valid CPU memory value.'); return; }
+
+  const maxParams = cpuMem / 12;
+  const sorted = Object.entries(KNOWN_MODELS).sort((a, b) => a[1].params - b[1].params);
+  const trainable = [];
+  const tooLarge = [];
+
+  sorted.forEach(([name, spec]) => {
+    const needed = calcCpuMemory(spec.params);
+    if (needed <= cpuMem) trainable.push({name, params: spec.params, needed});
+    else tooLarge.push({name, params: spec.params, needed});
+  });
+
+  let html = '';
+
+  // Stats
+  html += '<div class="stat-grid">';
+  html += `<div class="stat-card primary">
+    <div class="stat-label">CPU Memory</div>
+    <div class="stat-value">${cpuMem}<span class="stat-unit">GB</span></div>
+  </div>`;
+  html += `<div class="stat-card success">
+    <div class="stat-label">Max Model Size</div>
+    <div class="stat-value">${maxParams.toFixed(1)}<span class="stat-unit">B</span></div>
+  </div>`;
+  html += `<div class="stat-card primary">
+    <div class="stat-label">Trainable Models</div>
+    <div class="stat-value">${trainable.length}<span class="stat-unit"> / ${sorted.length}</span></div>
+  </div>`;
+  html += '</div>';
+
+  html += '<div class="note-box">';
+  html += '<strong>How it works:</strong> MegaTrain stores FP32 master weights (4 B/param) + Adam optimizer states m & v (8 B/param) in CPU RAM. ';
+  html += `Total = ~12× model size in BF16. With <strong>${cpuMem} GB</strong> RAM, you can train models up to <strong>~${maxParams.toFixed(1)}B</strong> parameters.`;
+  html += '</div>';
+
+  // Table
+  html += '<div class="model-table-wrap" style="margin-top:20px; max-height:520px; overflow-y:auto;">';
+  html += '<table><thead><tr><th>Model</th><th>Params</th><th>CPU Needed</th><th>Status</th></tr></thead><tbody>';
+
+  trainable.forEach(m => {
+    html += `<tr>
+      <td><strong>${m.name}</strong></td>
+      <td>${m.params.toFixed(1)}B</td>
+      <td>${m.needed.toFixed(0)} GB</td>
+      <td><span class="badge badge-ok">✓ OK</span></td>
+    </tr>`;
+  });
+
+  tooLarge.forEach(m => {
+    html += `<tr style="opacity:0.5">
+      <td>${m.name}</td>
+      <td>${m.params.toFixed(1)}B</td>
+      <td>${m.needed.toFixed(0)} GB</td>
+      <td><span class="badge badge-fail">✗ Need More</span></td>
+    </tr>`;
+  });
+
+  html += '</tbody></table></div>';
+
+  document.getElementById('cpuResults').innerHTML = html;
+}
+
+// ================================================================
+// Mode 2: GPU batch size calculation
+// ================================================================
+function calcGPU() {
+  const gpuMem = parseFloat(document.getElementById('gpuMem').value);
+  const seqLen = parseInt(document.getElementById('seqLen').value);
+  const modelKey = document.getElementById('modelSelect').value;
+
+  if (isNaN(gpuMem) || gpuMem <= 0) { alert('Please enter a valid GPU memory value.'); return; }
+  if (isNaN(seqLen) || seqLen <= 0) { alert('Please enter a valid context length.'); return; }
+
+  let name, params, hidden, layers, isHybrid = false, isMoe = false;
+
+  if (modelKey === '__custom__') {
+    name = 'Custom';
+    params = parseFloat(document.getElementById('customParams').value);
+    hidden = parseInt(document.getElementById('customHidden').value);
+    layers = parseInt(document.getElementById('customLayers').value);
+    if (isNaN(params) || isNaN(hidden) || isNaN(layers)) {
+      alert('Please fill in all custom model fields.'); return;
+    }
+  } else {
+    const spec = KNOWN_MODELS[modelKey];
+    name = modelKey;
+    params = spec.params;
+    hidden = spec.hidden;
+    layers = spec.layers;
+    isHybrid = !!spec.hybrid;
+    isMoe = !!spec.moe;
+  }
+
+  const cpuNeeded = calcCpuMemory(params);
+  const gpuFixed = calcGpuFixed(params, layers);
+  const available = Math.max(gpuMem - gpuFixed, 0);
+  const bs = calcBatchSize(gpuMem, params, hidden, layers, seqLen, DEFAULT_CHECKPOINT_INTERVAL, isHybrid);
+  const safeBs = Math.max(Math.floor(bs * 0.8), 1);
+  const aggBs = Math.floor(bs * 1.1);
+
+  let html = '';
+
+  if (bs <= 0) {
+    // Error: not enough GPU memory
+    html += `<div class="error-box">
+      ⚠️ GPU memory too small for this model!
+      <div class="sub">The model's layer buffers and gradient slabs require <strong>${gpuFixed.toFixed(1)} GB</strong>,
+      exceeding your <strong>${gpuMem.toFixed(0)} GB</strong> GPU. Try a smaller model or larger GPU.</div>
+    </div>`;
+    document.getElementById('gpuResults').innerHTML = html;
+    return;
+  }
+
+  // Stats
+  html += '<div class="stat-grid">';
+  html += `<div class="stat-card primary">
+    <div class="stat-label">Model</div>
+    <div class="stat-value" style="font-size:18px">${name}</div>
+  </div>`;
+  html += `<div class="stat-card success">
+    <div class="stat-label">Batch Size</div>
+    <div class="stat-value">${bs}</div>
+  </div>`;
+  html += `<div class="stat-card warning">
+    <div class="stat-label">GPU Fixed</div>
+    <div class="stat-value">${gpuFixed.toFixed(1)}<span class="stat-unit">GB</span></div>
+  </div>`;
+  html += `<div class="stat-card primary">
+    <div class="stat-label">For Activations</div>
+    <div class="stat-value">${available.toFixed(1)}<span class="stat-unit">GB</span></div>
+  </div>`;
+  html += `<div class="stat-card primary">
+    <div class="stat-label">CPU Needed</div>
+    <div class="stat-value">${cpuNeeded.toFixed(0)}<span class="stat-unit">GB</span></div>
+  </div>`;
+  html += '</div>';
+
+  // Batch size visual bars
+  html += '<div class="batch-visual">';
+  html += `<div class="batch-bar safe">
+    <div class="bar-label">Safe (80%)</div>
+    <div class="bar-value">${safeBs}</div>
+  </div>`;
+  html += `<div class="batch-bar recommended">
+    <div class="bar-label">★ Recommended</div>
+    <div class="bar-value">${bs}</div>
+  </div>`;
+  html += `<div class="batch-bar aggressive">
+    <div class="bar-label">Aggressive (110%)</div>
+    <div class="bar-value">${aggBs}</div>
+  </div>`;
+  html += '</div>';
+
+  // Notes
+  if (isHybrid) {
+    html += `<div class="note-box warn">
+      <strong>⚠️ Hybrid Attention Model:</strong> ${name} uses hybrid attention (linear + full).
+      Install <code>flash-linear-attention</code> + <code>causal-conv1d</code> for best performance.
+      Without them, actual batch size may be lower.
+    </div>`;
+  }
+  if (isMoe) {
+    html += `<div class="note-box warn">
+      <strong>⚠️ MoE Model:</strong> ${name} is a Mixture-of-Experts model. Actual memory varies
+      between dense and expert layers. Start with the <strong>safe</strong> batch size and adjust.
+    </div>`;
+  }
+
+  // Config snippet
+  html += '<div class="config-snippet" id="configSnippet">';
+  html += '<button class="copy-btn" onclick="copyConfig()">📋 Copy</button>';
+  html += `<span class="comment"># MegaTrain config — ${name}, ${gpuMem}GB GPU, seq_len=${seqLen}</span><br>`;
+  html += `<span class="key">training</span>:<br>`;
+  html += `  <span class="key">batch_size</span>: <span class="val">${bs}</span>  <span class="comment"># recommended</span>`;
+  html += '</div>';
+
+  document.getElementById('gpuResults').innerHTML = html;
+}
+
+function copyConfig() {
+  const modelKey = document.getElementById('modelSelect').value;
+  const gpuMem = document.getElementById('gpuMem').value;
+  const seqLen = document.getElementById('seqLen').value;
+  const name = modelKey === '__custom__' ? 'Custom' : modelKey;
+
+  // Recalculate bs
+  let params, hidden, layers, isHybrid = false;
+  if (modelKey === '__custom__') {
+    params = parseFloat(document.getElementById('customParams').value);
+    hidden = parseInt(document.getElementById('customHidden').value);
+    layers = parseInt(document.getElementById('customLayers').value);
+  } else {
+    const spec = KNOWN_MODELS[modelKey];
+    params = spec.params; hidden = spec.hidden; layers = spec.layers;
+    isHybrid = !!spec.hybrid;
+  }
+  const bs = calcBatchSize(parseFloat(gpuMem), params, hidden, layers, parseInt(seqLen), DEFAULT_CHECKPOINT_INTERVAL, isHybrid);
+
+  const text = `# MegaTrain config — ${name}, ${gpuMem}GB GPU, seq_len=${seqLen}\ntraining:\n  batch_size: ${bs}  # recommended\n`;
+  navigator.clipboard.writeText(text).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = '✓ Copied!';
+    setTimeout(() => btn.textContent = '📋 Copy', 1500);
+  }).catch(() => {});
+}
+
+// ================================================================
+// Init
+// ================================================================
+populateModelSelect();
+// Auto-calculate on load
+calcCPU();
+</script>
+</body>
+</html>
