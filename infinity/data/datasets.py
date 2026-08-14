@@ -325,8 +325,39 @@ class ChatDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    def _truncate_system_for_response(self, messages):
+        """Truncate long system prompts to guarantee the assistant response fits.
+
+        RAG-style datasets pack retrieval context into the system message,
+        often exceeding max_seq_len by itself.  We estimate token counts
+        and trim the system text from the end so that at least the full
+        assistant response (at least a third of max_seq_len) is preserved.
+        """
+        sys_idx = next((i for i, m in enumerate(messages) if m["role"] == "system"), None)
+        asst_idx = next((i for i, m in reversed(list(enumerate(messages))) if m["role"] == "assistant"), None)
+        if sys_idx is None or asst_idx is None:
+            return messages
+
+        asst_len = len(messages[asst_idx]["content"])
+
+        # Reserve ~30% of max_seq_len for the response, at a conservative 2.5 chars/token
+        chars_per_token = 2.5
+        response_budget_tokens = max(self.max_seq_len // 3, int(asst_len / chars_per_token) + 128)
+        overhead_tokens = 128
+        budget_for_sys_tokens = self.max_seq_len - response_budget_tokens - overhead_tokens
+        budget_for_sys_tokens = max(budget_for_sys_tokens, self.max_seq_len // 4)
+
+        max_sys_chars = int(budget_for_sys_tokens * chars_per_token)
+        sys_text = messages[sys_idx]["content"]
+        if len(sys_text) > max_sys_chars:
+            messages = [m.copy() for m in messages]
+            messages[sys_idx] = {**messages[sys_idx], "content": sys_text[:max_sys_chars] + "\n[context truncated]"}
+
+        return messages
+
     def __getitem__(self, idx):
         messages, images = self._get_messages(idx)
+        messages = self._truncate_system_for_response(messages)
 
         # Tokenize full conversation using tokenizer's native chat template
         text = self.tokenizer.apply_chat_template(
