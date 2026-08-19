@@ -1091,11 +1091,22 @@ class CPUMasterModel:
     #  Forward-only paths (VERL integration, single-GPU)
     # ------------------------------------------------------------------ #
 
-    def _forward_hidden(self, input_ids, attention_mask, pixel_values=None, **vision_kwargs):
+    def _forward_hidden(self, input_ids, attention_mask, pixel_values=None,
+                        collect_recompute_checkpoints=True, **vision_kwargs):
         """Run forward pass through all layers and return final hidden states.
 
         This is a shared helper used by both inference and training paths.
         Returns (hidden_after_norm, checkpoints, layer_kwargs, input_ids_gpu, B, T).
+
+        Args:
+            collect_recompute_checkpoints: When True (default), store a detached
+                activation every ``checkpoint_interval`` layers so the backward
+                pass can recompute each block. Forward-only callers that never
+                run backward can pass False to avoid pinning those activations
+                alive for the duration of the forward pass. The final entry,
+                ``checkpoints[len(self.cpu_layers)]``, is always populated —
+                callers such as ``forward_and_backward_custom_loss`` rely on it
+                and it aliases ``hidden``, so it costs no extra memory.
         """
         ctx = self.gpu_contexts[0]
         B, T = input_ids.shape
@@ -1145,7 +1156,7 @@ class CPUMasterModel:
                 buffer_idx = i % 2
                 next_buffer_idx = (i + 1) % 2
 
-                if i % self.config.checkpoint_interval == 0:
+                if collect_recompute_checkpoints and i % self.config.checkpoint_interval == 0:
                     checkpoints[i] = hidden.detach()
 
                 if i + 1 < len(self.cpu_layers):
@@ -1228,6 +1239,103 @@ class CPUMasterModel:
         # Concatenate on CPU then move to device 0
         logits = torch.cat(all_logits, dim=0).to(self.device)
         return logits
+
+    # ------------------------------------------------------------------ #
+    #  Forward-only loss (evaluation)
+    # ------------------------------------------------------------------ #
+
+    def compute_loss(self, input_ids, attention_mask, labels,
+                     pixel_values=None, **vision_kwargs):
+        """Forward-only cross-entropy loss, with no backward pass.
+
+        Intended for validation/evaluation, where the loss is only needed as a
+        metric. Runs entirely under ``torch.no_grad()``, so no autograd graph is
+        built and no parameter accumulates a gradient. Weights are not modified.
+
+        Logits are materialised in ``chunk_size`` slices along the sequence
+        dimension rather than all at once. A full ``[B, T, V]`` logits tensor is
+        the dominant allocation on large-vocabulary models, so chunking keeps
+        evaluation memory close to the training step's rather than several times
+        higher.
+
+        Args:
+            input_ids: [B, T] input token IDs
+            attention_mask: [B, T] attention mask
+            labels: [B, T] target token IDs, with -100 marking ignored positions
+            pixel_values: Optional image tensor for VLM
+            **vision_kwargs: Additional vision kwargs
+
+        Returns:
+            (loss, num_valid_tokens) where loss is the mean cross-entropy over
+            non-ignored positions as a Python float, and num_valid_tokens is the
+            count of those positions. Returns ``(0.0, 0)`` if the batch is
+            entirely masked, so callers can skip it without special-casing NaN.
+
+        Raises:
+            NotImplementedError: In multi-GPU mode. Evaluation is not fanned out
+                to the worker processes, and silently evaluating on one GPU would
+                report a loss over a fraction of the batch. Note this is a
+                subclass of RuntimeError.
+        """
+        if self.use_multiprocessing:
+            raise NotImplementedError(
+                f"compute_loss is only implemented for single-GPU mode, but this "
+                f"model was built with world_size={self.world_size}. Evaluate on a "
+                f"single-GPU model, or split the batch and average the per-rank "
+                f"losses weighted by their valid-token counts."
+            )
+
+        ctx = self.gpu_contexts[0]
+
+        with torch.no_grad():
+            # Forward-only: skip the per-block recompute checkpoints, since
+            # nothing here runs backward.
+            hidden_after_norm, checkpoints, _, _, _, T = self._forward_hidden(
+                input_ids, attention_mask, pixel_values,
+                collect_recompute_checkpoints=False, **vision_kwargs
+            )
+            checkpoints.clear()
+
+            labels_gpu = labels.to(ctx.device)
+            V = self.vocab_size
+            chunk_size = 128
+
+            total_loss = torch.zeros((), device=ctx.device, dtype=torch.float32)
+            total_valid_tokens = 0
+
+            for t_start in range(0, T - 1, chunk_size):
+                t_end = min(t_start + chunk_size, T - 1)
+                h = hidden_after_norm[:, t_start:t_end, :]
+                y = labels_gpu[:, t_start+1:t_end+1]
+                logits = ctx.lm_head_gpu(h)
+                flat_y = y.reshape(-1)
+                flat_logits = logits.reshape(-1, V)
+
+                if ctx.ce_loss is not None:
+                    per_tok = ctx.ce_loss(flat_logits, flat_y)
+                    valid = (flat_y != -100)
+                    loss_chunk = per_tok[valid].sum()
+                    total_valid_tokens += int(valid.sum().item())
+                else:
+                    loss_chunk = nn.functional.cross_entropy(
+                        flat_logits, flat_y, ignore_index=-100, reduction='sum'
+                    )
+                    total_valid_tokens += int((flat_y != -100).sum().item())
+
+                total_loss = total_loss + loss_chunk
+                del logits, loss_chunk
+
+            if total_valid_tokens == 0:
+                logger.warning("No valid tokens in evaluation batch! Skipping...")
+                return 0.0, 0
+
+            loss_val = (total_loss / total_valid_tokens).item()
+            del labels_gpu, hidden_after_norm, total_loss
+
+        if not torch.isfinite(torch.tensor(loss_val)):
+            logger.error(f"Evaluation loss is {loss_val}!")
+
+        return loss_val, total_valid_tokens
 
     # ------------------------------------------------------------------ #
     #  Forward + backward
