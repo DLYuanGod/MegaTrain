@@ -15,8 +15,19 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+def _flash_attn_available() -> bool:
+    try:
+        import flash_attn  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+# CUDA and flash-attn are both required, not just CUDA: the model calls decoder
+# layers directly with a 2D attention mask, which only flash-attention accepts.
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CPUMasterModel requires CUDA"
+    not torch.cuda.is_available() or not _flash_attn_available(),
+    reason="CPUMasterModel requires CUDA and flash-attn",
 )
 
 
@@ -40,13 +51,22 @@ def _build_tiny_model():
         num_key_value_heads=4,
         max_position_embeddings=128,
     )
-    hf_model = LlamaForCausalLM(hf_config)
+    # flash_attention_2 must be set on the *HuggingFace* model, not only on
+    # CPUMasterConfig. CPUMasterModel calls each decoder layer directly and
+    # passes the 2D [B, T] attention mask straight through, which only
+    # flash-attention accepts. Under SDPA or eager, torch requires a 4D float
+    # mask and raises. Verified on an A10G: with the HF model left at its
+    # default attention implementation, every GPU test here fails inside
+    # scaled_dot_product_attention rather than in compute_loss.
+    hf_model = LlamaForCausalLM._from_config(
+        hf_config, attn_implementation="flash_attention_2"
+    )
 
     config = CPUMasterConfig(
         model_name="tiny-llama-for-tests",
-        dataset_name="dummy",          # __post_init__ requires a dataset
-        attn_implementation="eager",   # no flash-attn dependency
-        dtype=torch.float32,           # tight tolerance for the parity check
+        dataset_name="dummy",                      # __post_init__ needs a dataset
+        attn_implementation="flash_attention_2",   # must match the HF model above
+        dtype=torch.bfloat16,
         max_seq_len=32,
         batch_size=2,
         checkpoint_interval=2,
