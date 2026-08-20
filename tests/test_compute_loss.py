@@ -58,8 +58,11 @@ def _build_tiny_model():
     # mask and raises. Verified on an A10G: with the HF model left at its
     # default attention implementation, every GPU test here fails inside
     # scaled_dot_product_attention rather than in compute_loss.
+    # bfloat16, not float32: flash-attention rejects fp32 with "FlashAttention
+    # only support fp16 and bf16 data type". The HF model's dtype is independent
+    # of CPUMasterConfig.dtype, so both have to be set.
     hf_model = LlamaForCausalLM._from_config(
-        hf_config, attn_implementation="flash_attention_2"
+        hf_config, attn_implementation="flash_attention_2", dtype=torch.bfloat16
     )
 
     config = CPUMasterConfig(
@@ -146,7 +149,12 @@ def test_compute_loss_matches_training_loss():
             f"valid token count {eval_tokens} != expected {expected_tokens}"
         )
 
-        assert eval_loss == pytest.approx(train_loss, rel=1e-4), (
+        # Tolerance is bf16-sized. The two paths are arithmetically equivalent
+        # but not bit-identical: the training path re-applies the norm to a
+        # detached checkpoint before the loss loop, so the reduction happens over
+        # a differently-rounded tensor. bfloat16 carries ~3 significant decimal
+        # digits, which sets the floor here.
+        assert eval_loss == pytest.approx(train_loss, rel=2e-2), (
             f"eval loss {eval_loss} != train loss {train_loss}"
         )
         print(f"[ok] eval loss {eval_loss:.6f} matches train loss {train_loss:.6f}")
