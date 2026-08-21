@@ -10,14 +10,16 @@ Supports:
 - LlamaFactory-compatible dataset_info.json registry
 """
 
+import hashlib
 import json
 import logging
 import os
+import random
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 logger = logging.getLogger(__name__)
 
@@ -439,3 +441,81 @@ def collate_fn(batch):
                 pass  # Skip non-stackable fields
 
     return result
+
+
+def split_dataset_for_validation(
+    dataset: Dataset,
+    *,
+    split_fraction: float,
+    seed: int,
+    max_samples: int,
+):
+    """Create deterministic, disjoint train and validation subsets.
+
+    The original dataset remains the sole tokenization and prompt-masking
+    implementation for both subsets. The validation seed selects indices but
+    does not alter their source order, keeping evaluation reproducible across
+    GPUs and experiment rungs.
+
+    Args:
+        dataset: Map-style dataset to split.
+        split_fraction: Target fraction of samples held out for validation.
+        seed: Seed for the index shuffle; the same seed always yields the
+            same split for a given dataset size.
+        max_samples: Upper bound on validation samples. Validation is also
+            capped at ``len(dataset) - 1`` so training is never empty.
+
+    Returns:
+        ``(train_subset, validation_subset, metadata)`` where metadata includes
+        a stable split fingerprint suitable for cross-run comparisons.
+    """
+    dataset_size = len(dataset)
+    if dataset_size < 2:
+        raise ValueError(
+            "validation requires a dataset with at least two samples."
+        )
+
+    validation_samples = max(1, int(dataset_size * split_fraction))
+    validation_samples = min(validation_samples, max_samples, dataset_size - 1)
+
+    shuffled_indices = list(range(dataset_size))
+    random.Random(seed).shuffle(shuffled_indices)
+    validation_indices = sorted(shuffled_indices[:validation_samples])
+    train_indices = sorted(shuffled_indices[validation_samples:])
+
+    source_dataset = getattr(dataset, "dataset", dataset)
+    source_fingerprint = getattr(source_dataset, "_fingerprint", None)
+    if not source_fingerprint:
+        source_fingerprint = (
+            f"{type(source_dataset).__module__}."
+            f"{type(source_dataset).__qualname__}:{dataset_size}"
+        )
+
+    fingerprint_payload = {
+        "version": 1,
+        "source_fingerprint": str(source_fingerprint),
+        "dataset_size": dataset_size,
+        "split_fraction": float(split_fraction),
+        "seed": seed,
+        "max_samples": max_samples,
+        "validation_indices": validation_indices,
+    }
+    encoded_payload = json.dumps(
+        fingerprint_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(encoded_payload).hexdigest()
+
+    metadata = {
+        "fingerprint": fingerprint,
+        "source_fingerprint": str(source_fingerprint),
+        "dataset_size": dataset_size,
+        "train_samples": len(train_indices),
+        "validation_samples": len(validation_indices),
+        "split_fraction": float(split_fraction),
+        "seed": seed,
+        "max_samples": max_samples,
+        "validation_indices": tuple(validation_indices),
+    }
+    return Subset(dataset, train_indices), Subset(dataset, validation_indices), metadata
