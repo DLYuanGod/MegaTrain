@@ -19,6 +19,7 @@ import inspect
 import logging
 import copy
 import gc
+import os
 import threading
 import queue
 import torch
@@ -1893,3 +1894,53 @@ class CPUMasterModel:
             self.worker_stop.set()
             self.worker_thread.join(timeout=5.0)
             logger.info("Gradient worker thread stopped")
+
+    def save_checkpoint(self, hf_model, tokenizer, output_dir: str, save_bf16: bool = True):
+        """Save fine-tuned model in HuggingFace format.
+
+        Gathers FP32 master weights from CPU, writes them back into the
+        HuggingFace model shell, optionally casts to BF16, and saves via
+        ``save_pretrained``.
+
+        Args:
+            hf_model: The original HuggingFace model (used as the save shell).
+                      Its weights will be overwritten with the trained master weights.
+            tokenizer: HuggingFace tokenizer to save alongside.
+            output_dir: Directory for the saved checkpoint.
+            save_bf16: If True, cast weights to bfloat16 before saving (default).
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving checkpoint to {output_dir} (bf16={save_bf16})...")
+
+        components = _discover_model_components(hf_model)
+
+        # Embedding
+        for p_hf, p_cpu in zip(components['embedding'].parameters(), self.embedding.parameters()):
+            p_hf.data.copy_(p_cpu.data)
+
+        # Decoder layers
+        for layer_hf, layer_cpu in zip(components['layers'], self.cpu_layers):
+            for p_hf, p_cpu in zip(layer_hf.parameters(), layer_cpu.parameters()):
+                p_hf.data.copy_(p_cpu.data)
+
+        # Final norm
+        if components['norm'] is not None and self.norm is not None:
+            for p_hf, p_cpu in zip(components['norm'].parameters(), self.norm.parameters()):
+                p_hf.data.copy_(p_cpu.data)
+
+        # LM head (skip if tied — embedding already updated)
+        if not self.tied_lm_head:
+            for p_hf, p_cpu in zip(components['lm_head'].parameters(), self.lm_head.parameters()):
+                p_hf.data.copy_(p_cpu.data)
+
+        if save_bf16:
+            hf_model = hf_model.to(torch.bfloat16)
+
+        hf_model.save_pretrained(output_dir, safe_serialization=True)
+        tokenizer.save_pretrained(output_dir)
+
+        total_size = sum(
+            os.path.getsize(os.path.join(output_dir, f))
+            for f in os.listdir(output_dir) if f.endswith(('.safetensors', '.bin'))
+        )
+        logger.info(f"Checkpoint saved: {output_dir} ({total_size / 1024**3:.1f} GB)")
