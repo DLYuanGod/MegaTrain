@@ -49,14 +49,15 @@ def _create_worker_gpu_context(rank, device_id, shared_state):
     ctx.gpu_layer_templates = {}
     for gid, group in shared_state.layer_groups.items():
         representative_idx = group['indices'][0]
-        templates = []
-        for _ in range(2):
+        # Execution selects layer_idx % 2; some groups only use one slot.
+        templates = [None, None]
+        for slot in sorted({i % 2 for i in group['indices']}):
             template = copy.deepcopy(shared_state.cpu_layers[representative_idx])
             _preserve_attn_implementation(template, shared_state._model_config)
             template = template.to(device)
             for p in template.parameters():
                 p.requires_grad_(False)
-            templates.append(template)
+            templates[slot] = template
         ctx.gpu_layer_templates[gid] = templates
 
     # GPU modules
@@ -788,14 +789,15 @@ def _worker_rebuild_gpu(ctx, shared_state):
     ctx.gpu_layer_templates = {}
     for gid, group in shared_state.layer_groups.items():
         representative_idx = group['indices'][0]
-        templates = []
-        for _ in range(2):
+        # Keep the same slot layout when rebuilding released templates.
+        templates = [None, None]
+        for slot in sorted({i % 2 for i in group['indices']}):
             template = copy.deepcopy(shared_state.cpu_layers[representative_idx])
             _preserve_attn_implementation(template, shared_state._model_config)
             template = template.to(device)
             for p in template.parameters():
                 p.requires_grad_(False)
-            templates.append(template)
+            templates[slot] = template
         ctx.gpu_layer_templates[gid] = templates
 
     # Rebuild GPU modules
